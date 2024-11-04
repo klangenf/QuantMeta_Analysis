@@ -1,0 +1,2642 @@
+---
+title: "Detection Threshold Analysis"
+output: html_notebook
+---
+
+Purpose: Develop the detection threshold and figures relying solely on read mapping to standards sequences
+
+Load required libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+library(MASS)
+library(scales)
+library(gridExtra)
+library(cowplot)
+library(ggpmisc)
+library(pROC)
+library(ggpubr)
+library(ggbeeswarm)
+library(cutpointr)
+library(data.table)
+library(lattice)
+
+pretty_plot <- theme_classic() + theme(
+  #text = element_text(family = "Lucinda Sans", color = "black"),
+  plot.margin = margin(1,1,1,1, "cm"),
+  axis.line.x.bottom = element_line(color = "black", size = 0.5),
+  axis.line.y.left = element_line(color = "black", size = 0.5),
+  panel.border = element_rect(colour="black", fill = NA, size = 0.5),
+  strip.background = element_blank(),
+  strip.text = element_text(size = 12),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  plot.title = element_text(size = 15),
+  axis.title = element_text(size = 12), 
+  axis.text.y = element_text(size = 12, color = "#000000"),
+  axis.text.x = element_text(size = 12, color = "#000000"))
+```
+
+Determine coverage, average read depth (i.e. gene copies), and LOD parameters of each target
+```{r}
+mapping_analysis <- function(sample_name, mapping_results, target_lengths, min_bp) {
+  # make a list of the standards ID in the mapping file
+  targets = data.frame(unique(mapping_results$ID))
+  colnames(targets) <- "ID"
+  targets <- merge.data.frame(targets, target_lengths, by = "ID")
+  colnames(targets) <- c("ID", "length")
+  targets$cover_count <- 0
+  targets$B_G <- 0
+  targets$gene_copies <- 0
+  targets$I_G <- 0
+  targets$E_rel <- 0
+  targets$C_o <- 0
+  targets$C_e <- 0
+  targets$R_FVE <- 0
+  targets$LOD <- 0
+  
+  for(i in 1:nrow(targets)) {
+    # select genome information on specific genome from mapping table
+    target = subset(mapping_results, ID == targets$ID[i])
+    target$I_G_x <- 0
+    targets$cover_count[i] = nrow(subset(target, read_depth > 0))
+    
+    # Calculate total number of bases mapping to genome and the average read depth (gene copies)
+    targets$B_G[i] = sum(target$read_depth)
+    targets$gene_copies[i] = mean(target$read_depth)
+    
+    # Calculate I_G and number of positions covered by at least 1 read
+    target$I_G_x <- (target$read_depth/targets$B_G[i])*log(target$read_depth/targets$B_G[i])
+    targets$I_G[i] <- -sum(na.omit(target$I_G_x))
+    
+    # Calculate E_rel
+    targets$E_rel[i] = targets$I_G[i]/log(targets$length[i])
+    
+    # FastViromeExplorer LOD parameters
+    targets$C_o[i] = targets$cover_count[i]/targets$length[i]
+    targets$C_e[i] = 1 - exp(-targets$B_G[i]/targets$length[i])
+    if(targets$C_e[i] != 0) {
+      targets$R_FVE[i] = targets$C_o[i]/targets$C_e[i]
+    }
+    if(targets$C_o[i] > 0.1 & targets$R_FVE[i] > 0.3 & targets$B_G[i] > min_bp) {
+      targets$LOD[i] = 1 # Passed LOD requirement
+    }
+    if(!(targets$C_o[i] > 0.1 & targets$R_FVE[i] > 0.3 & targets$B_G[i] > min_bp)) {
+      targets$LOD[i] = 0 # Failed LOD requirement
+    }
+  }
+  
+  mapping_targets_logit = data.frame(cbind(targets$ID, targets$E_rel, targets$LOD))
+  colnames(mapping_targets_logit) <- c("ID", "E_rel", "LOD")
+  mapping_targets_analysis = data.frame(cbind(targets$ID, targets$E_rel, targets$C_o, targets$R_FVE, targets$B_G, targets$gene_copies))
+  colnames(mapping_targets_analysis) <- c("ID", "E_rel", "C_o", "R_FVE", "B_G", "gene_copies")
+  
+  output = "sample/standards_mapping_analysis.txt"
+  output = gsub("sample", sample_name, output)
+  write.table(mapping_targets_analysis, file = output, append = FALSE, sep = "\t", row.names = FALSE, col.names = TRUE)
+  output2 = "sample/standards_logit.txt"
+  output2 = gsub("sample", sample_name, output2)
+  write.table(mapping_targets_logit, file = output2, append = FALSE, sep = "\t", row.names = FALSE, col.names = TRUE)
+  
+  return(mapping_targets_analysis)
+} 
+```
+
+Create and upload logistic regression model data for each sample (100% and 20% downsample) for each tested min bp cut-off (0, 400, 1000)
+```{r}
+samples <- c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1", "EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1")
+min_bp <- c(0, 400, 1000)
+
+STDS <- as.data.frame(read.table("Spike-ins/STD_MIXES.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+STDS_list <- subset(STDS, !(is.na(MIX_A)))
+STDS_list <- rbind.data.frame(STDS_list, subset(STDS, !(is.na(ssDNA))))
+STDS_list <- data.frame(STDS_list$ID, STDS_list$length)
+colnames(STDS_list) <- c("ID", "length")
+
+for (j in min_bp) {
+  for (i in samples) {
+    filename = "Mapping/sample/standards_mapping.txt"
+    filename = gsub("sample", i, filename)
+    mapping_results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    directory = "Mapping/sample/standards_minbp"
+    directory = gsub("sample", i, directory)
+    directory = gsub("minbp", j, directory)
+    mapping_target_analysis <- mapping_analysis(directory, mapping_results, STDS_list, j)
+    filename = "Mapping/sample/standards_minbp/standards_logit.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    all <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    all$downsample <- rep(100)
+    filename = "Mapping/sample/standards_minbp/standards_mapping_analysis.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    results$downsample <- rep(100)
+    all <- cbind.data.frame(all, results$gene_copies)
+    colnames(all) <- c("ID", "E_rel", "LOD", "downsample", "gene_copies")
+    
+    filename = "Mapping/sample_20/standards_mapping.txt"
+    filename = gsub("sample", i, filename)
+    mapping_results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    directory = "Mapping/sample_20/standards_minbp"
+    directory = gsub("sample", i, directory)
+    directory = gsub("minbp", j, directory)
+    mapping_target_analysis <- mapping_analysis(directory, mapping_results, STDS_list, j)
+    filename = "Mapping/sample_20/standards_minbp/standards_logit.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    down <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    down$downsample <- rep(20)
+    filename = "Mapping/sample_20/standards_minbp/standards_mapping_analysis.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    results_2 <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    results_2$downsample <- rep(20)
+    down <- cbind.data.frame(down, results_2$gene_copies)
+    colnames(down) <- c("ID", "E_rel", "LOD", "downsample", "gene_copies")
+    
+    filename = "Mapping/sample_1/standards_mapping.txt"
+    filename = gsub("sample", i, filename)
+    mapping_results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    directory = "Mapping/sample_1/standards_minbp"
+    directory = gsub("sample", i, directory)
+    directory = gsub("minbp", j, directory)
+    mapping_target_analysis <- mapping_analysis(directory, mapping_results, STDS_list, j)
+    filename = "Mapping/sample_1/standards_minbp/standards_logit.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    down1 <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    down1$downsample <- rep(1)
+    filename = "Mapping/sample_1/standards_minbp/standards_mapping_analysis.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    results_3 <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    results_3$downsample <- rep(1)
+    down1 <- cbind.data.frame(down1, results_3$gene_copies)
+    colnames(down1) <- c("ID", "E_rel", "LOD", "downsample", "gene_copies")
+    
+    all <- rbind.data.frame(all, down, down1)
+    results <- rbind.data.frame(results, results_2, results_3)
+    
+    df_title = "sample_minbp"
+    df_title = gsub("sample", i , df_title)
+    df_title = gsub("minbp", j, df_title)
+    assign(df_title, all)
+    
+    df_title = "sample_minbp_info"
+    df_title = gsub("sample", i, df_title)
+    df_title = gsub("minbp", j, df_title)
+    assign(df_title, results)
+  }
+}
+
+```
+
+Combine mapping for each round of mutations to make a complete fail_standards dataset
+```{r}
+library(seqinr)
+
+for (j in 1:5) {
+  filename <- "Map_Indexes/fail_standards_rset/fail_standards.fasta"
+  filename <- gsub("set", j, filename)
+  temp <- read.fasta(filename)
+  
+  for (i in 1:length(temp)) {
+    temp1 <- data.frame("nucleic_acid" = temp[[i]][1:length(temp[[i]])])
+    temp1$position <- c(1:nrow(temp1))
+    temp1$ID <- attr(temp[[i]], "name")
+    temp1$nucleic_acid[temp1$nucleic_acid == "a"] <- "A"
+    temp1$nucleic_acid[temp1$nucleic_acid == "t"] <- "T"
+    temp1$nucleic_acid[temp1$nucleic_acid == "g"] <- "G"
+    temp1$nucleic_acid[temp1$nucleic_acid == "c"] <- "C"
+  
+    if (i == 1) {
+      fail_std <- temp1
+    } else {
+      fail_std <- rbind.data.frame(fail_std, temp1)
+    }
+  }
+  
+  filename <- "Map_Indexes/fail_standards_rset/fail_standards.txt"
+  filename <- gsub("set", j, filename)
+  write.table(fail_std, filename, quote = FALSE, sep = "\t", row.names = FALSE, col.names = TRUE)
+}
+```
+
+```{r}
+fail_std <- as.data.frame(read.table("Map_Indexes/fail_standards_r5/fail_standards_lengths.txt", sep = "\t", header = FALSE))
+colnames(fail_std) <- c("ID", "length")
+fail_std$ID <- paste(fail_std$ID, "5xmut", sep = "_")
+std_4xmut <- as.data.frame(read.table("Map_Indexes/fail_standards_r4/fail_standards_lengths.txt", sep = "\t", header = FALSE))
+colnames(std_4xmut) <- c("ID", "length")
+std_4xmut$ID <- paste(std_4xmut$ID, "4xmut", sep = "_")
+std_3xmut <- as.data.frame(read.table("Map_Indexes/fail_standards_r3/fail_standards_lengths.txt", sep = "\t", header = FALSE))
+colnames(std_3xmut) <- c("ID", "length")
+std_3xmut$ID <- paste(std_3xmut$ID, "3xmut", sep = "_")
+std_2xmut <- as.data.frame(read.table("Map_Indexes/fail_standards_r2/fail_standards_lengths.txt", sep = "\t", header = FALSE))
+colnames(std_2xmut) <- c("ID", "length")
+std_2xmut$ID <- paste(std_2xmut$ID, "2xmut", sep = "_")
+std_1xmut <- as.data.frame(read.table("Map_Indexes/fail_standards_r1/fail_standards_lengths.txt", sep = "\t", header = FALSE))
+colnames(std_1xmut) <- c("ID", "length")
+std_1xmut$ID <- paste(std_1xmut$ID, "1xmut", sep = "_")
+
+fail_std <- rbind.data.frame(fail_std, std_4xmut, std_3xmut, std_2xmut, std_1xmut)
+```
+
+```{r}
+#F_STDS_list <- data.frame(unique(fail_std$ID))
+#colnames(F_STDS_list) <- c("ID")
+#F_STDS_list$length <- 0
+#for (i in 1:nrow(F_STDS_list)) {
+#  F_STDS_list$length[i] <- max(fail_std$position[fail_std$ID == F_STDS_list$ID[i]])
+#}
+F_STDS_list <- fail_std
+
+downsample = c("", "_20", "_1")
+
+for (j in downsample) {
+  for (i in samples) {
+    filename = "Mapping/sampledown/fail_standards_r1_mapping.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("down", j, filename)
+    fail_standards <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    if (nrow(fail_standards) != 0) {fail_standards$ID <- paste(fail_standards$ID, "1xmut", sep = "_")}
+    
+    filename = "Mapping/sampledown/fail_standards_r5_mapping.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("down", j, filename)
+    temp <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    if (nrow(temp) != 0) {
+      temp$ID <- paste(temp$ID, "5xmut", sep = "_")
+      fail_standards <- rbind.data.frame(fail_standards, temp)
+    }
+    
+    filename = "Mapping/sampledown/fail_standards_r2_mapping.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("down", j, filename)
+    temp <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    if (nrow(temp) != 0) {
+      temp$ID <- paste(temp$ID, "2xmut", sep = "_")
+      fail_standards <- rbind.data.frame(fail_standards, temp)
+    }
+    
+    filename = "Mapping/sampledown/fail_standards_r3_mapping.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("down", j, filename)
+    temp <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    if (nrow(temp) != 0) {
+      temp$ID <- paste(temp$ID, "3xmut", sep = "_")
+      fail_standards <- rbind.data.frame(fail_standards, temp)
+    }
+    
+    filename = "Mapping/sampledown/fail_standards_r4_mapping.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("down", j, filename)
+    temp <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    if (nrow(temp) != 0) {
+      temp$ID <- paste(temp$ID, "4xmut", sep = "_")
+      fail_standards <- rbind.data.frame(fail_standards, temp)
+    }
+    
+    name = "sampledown_fail_mapping"
+    name = gsub("sample", i, name)
+    name = gsub("down", j, name)
+    assign(name, fail_standards)
+  }
+}
+
+fail_mapping_list <- rep(list(INF_1_1_fail_mapping, INF_2_1_fail_mapping, INF_2_2_fail_mapping, INF_2_3_fail_mapping, 
+                          INF_3_1_fail_mapping, EFF_1_1_fail_mapping, EFF_2_1_fail_mapping, EFF_2_2_fail_mapping, 
+                          EFF_2_3_fail_mapping, EFF_3_1_fail_mapping), 3)
+fail_mapping_list_20 <- rep(list(INF_1_1_20_fail_mapping, INF_2_1_20_fail_mapping, INF_2_2_20_fail_mapping, 
+                             INF_2_3_20_fail_mapping, INF_3_1_20_fail_mapping, EFF_1_1_20_fail_mapping, 
+                             EFF_2_1_20_fail_mapping, EFF_2_2_20_fail_mapping, EFF_2_3_20_fail_mapping, 
+                             EFF_3_1_20_fail_mapping), 3)
+fail_mapping_list_1 <- rep(list(INF_1_1_1_fail_mapping, INF_2_1_1_fail_mapping, INF_2_2_1_fail_mapping, 
+                            INF_2_3_1_fail_mapping, INF_3_1_1_fail_mapping, EFF_1_1_1_fail_mapping, 
+                            EFF_2_1_1_fail_mapping, EFF_2_2_1_fail_mapping, EFF_2_3_1_fail_mapping, 
+                            EFF_3_1_1_fail_mapping), 3)
+
+c = 1
+for (j in min_bp) {
+  for (i in samples) {
+    mapping_results <- fail_mapping_list[[c]]
+    directory = "Mapping/sample/fail_standards_minbp"
+    directory = gsub("sample", i, directory)
+    directory = gsub("minbp", j, directory)
+    mapping_target_analysis <- mapping_analysis(directory, mapping_results, F_STDS_list, j)
+    filename = "Mapping/sample/fail_standards_minbp/standards_logit.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    all <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    all$downsample <- rep(100)
+    filename = "Mapping/sample/fail_standards_minbp/standards_mapping_analysis.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    results$downsample <- rep(100)
+    all <- cbind.data.frame(all, results$gene_copies)
+    colnames(all) <- c("ID", "E_rel", "LOD", "downsample", "gene_copies")
+    
+    mapping_results <- fail_mapping_list_20[[c]]
+    directory = "Mapping/sample_20/fail_standards_minbp"
+    directory = gsub("sample", i, directory)
+    directory = gsub("minbp", j, directory)
+    mapping_target_analysis <- mapping_analysis(directory, mapping_results, F_STDS_list, j)
+    filename = "Mapping/sample_20/fail_standards_minbp/standards_logit.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    down <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    down$downsample <- rep(20)
+    filename = "Mapping/sample_20/fail_standards_minbp/standards_mapping_analysis.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    results_2 <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    results_2$downsample <- rep(20)
+    down <- cbind.data.frame(down, results_2$gene_copies)
+    colnames(down) <- c("ID", "E_rel", "LOD", "downsample", "gene_copies")
+    
+    mapping_results <- fail_mapping_list_1[[c]]
+    directory = "Mapping/sample_1/fail_standards_minbp"
+    directory = gsub("sample", i, directory)
+    directory = gsub("minbp", j, directory)
+    mapping_target_analysis <- mapping_analysis(directory, mapping_results, F_STDS_list, j)
+    filename = "Mapping/sample_1/fail_standards_minbp/standards_logit.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    down1 <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    down1$downsample <- rep(1)
+    filename = "Mapping/sample_1/fail_standards_minbp/standards_mapping_analysis.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    results_3 <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    results_3$downsample <- rep(1)
+    down1 <- cbind.data.frame(down1, results_3$gene_copies)
+    colnames(down1) <- c("ID", "E_rel", "LOD", "downsample", "gene_copies")
+    
+    all <- rbind.data.frame(all, down, down1)
+    results <- rbind.data.frame(results, results_2, results_3)
+    
+    df_title = "sample_minbp_fail"
+    df_title = gsub("sample", i , df_title)
+    df_title = gsub("minbp", j, df_title)
+    assign(df_title, all)
+    
+    df_title = "sample_minbp_fail_info"
+    df_title = gsub("sample", i, df_title)
+    df_title = gsub("minbp", j, df_title)
+    assign(df_title, results)
+    
+    c = c+1
+  }
+}
+
+```
+
+```{r}
+df_logreg <- list(INF_1_1_0, INF_1_1_400, INF_1_1_1000, INF_2_1_0, INF_2_1_400, INF_2_1_1000, INF_2_2_0, INF_2_2_400, INF_2_2_1000, INF_2_3_0, INF_2_3_400, 
+                  INF_2_3_1000, INF_3_1_0, INF_3_1_400, INF_3_1_1000, EFF_1_1_0, EFF_1_1_400, EFF_1_1_1000, EFF_2_1_0, EFF_2_1_400, EFF_2_1_1000, EFF_2_2_0,
+                  EFF_2_2_400, EFF_2_2_1000, EFF_2_3_0, EFF_2_3_400, EFF_2_3_1000, EFF_3_1_0, EFF_3_1_400, EFF_3_1_1000)
+model_names <- data.frame(c("INF_1_1_0", "INF_1_1_400", "INF_1_1_1000", "INF_2_1_0", "INF_2_1_400", "INF_2_1_1000", "INF_2_2_0", "INF_2_2_400", "INF_2_2_1000", "INF_2_3_0",
+                 "INF_2_3_400", "INF_2_3_1000", "INF_3_1_0", "INF_3_1_400", "INF_3_1_1000", "EFF_1_1_0", "EFF_1_1_400", "EFF_1_1_1000", "EFF_2_1_0", "EFF_2_1_400",
+                 "EFF_2_1_1000", "EFF_2_2_0", "EFF_2_2_400", "EFF_2_2_1000", "EFF_2_3_0", "EFF_2_3_400", "EFF_2_3_1000", "EFF_3_1_0", "EFF_3_1_400", "EFF_3_1_1000"))
+model_info<- list(INF_1_1_0_info, INF_1_1_400_info, INF_1_1_1000_info, INF_2_1_0_info, INF_2_1_400_info, INF_2_1_1000_info, INF_2_2_0_info, INF_2_2_400_info, 
+                  INF_2_2_1000_info, INF_2_3_0_info, INF_2_3_400_info, INF_2_3_1000_info, INF_3_1_0_info, INF_3_1_400_info, INF_3_1_1000_info, EFF_1_1_0_info, 
+                  EFF_1_1_400_info, EFF_1_1_1000_info, EFF_2_1_0_info, EFF_2_1_400_info, EFF_2_1_1000_info, EFF_2_2_0_info, EFF_2_2_400_info, EFF_2_2_1000_info, 
+                  EFF_2_3_0_info, EFF_2_3_400_info, EFF_2_3_1000_info, EFF_3_1_0_info, EFF_3_1_400_info, EFF_3_1_1000_info)
+minbp_model <- c(rep(min_bp, 10))
+
+classify_targets <- function(logreg_df, info_df, minbp) {
+  logreg_df$fail_cat <- "TBD"
+  logreg_df$fail_cat[logreg_df$LOD == 1] <- "Pass"
+  logreg_df$fail_cat[info_df$C_o <= 0.1 & info_df$R_FVE <= 0.3 & info_df$B_G <= minbp] <- "All_Fail"
+  logreg_df$fail_cat[info_df$C_o <= 0.1 & info_df$R_FVE > 0.3 & info_df$B_G > minbp] <- "Cov_Fail"
+  logreg_df$fail_cat[info_df$C_o > 0.1 & info_df$R_FVE <= 0.3 & info_df$B_G > minbp] <- "Dist_Fail"
+  logreg_df$fail_cat[info_df$C_o > 0.1 & info_df$R_FVE > 0.3 & info_df$B_G <= minbp] <- "bp_Fail"
+  logreg_df$fail_cat[info_df$C_o <= 0.1 & info_df$R_FVE <= 0.3 & info_df$B_G > minbp] <- "Cov_Dist_Fail"
+  logreg_df$fail_cat[info_df$C_o <= 0.1 & info_df$R_FVE > 0.3 & info_df$B_G <= minbp] <- "Cov_bp_Fail"
+  logreg_df$fail_cat[info_df$C_o > 0.1 & info_df$R_FVE <= 0.3 & info_df$B_G <= minbp] <- "Dist_bp_Fail"
+  
+  return(logreg_df)
+}
+
+for (i in 1:nrow(model_names)) {
+  a <- classify_targets(df_logreg[[i]], model_info[[i]], minbp_model[i])
+  
+  assign(model_names[i,], a)
+}
+
+# for fail set
+df_logreg <- list(INF_1_1_0_fail, INF_1_1_400_fail, INF_1_1_1000_fail, INF_2_1_0_fail, INF_2_1_400_fail, INF_2_1_1000_fail, INF_2_2_0_fail, INF_2_2_400_fail, 
+                  INF_2_2_1000_fail, INF_2_3_0_fail, INF_2_3_400_fail, INF_2_3_1000_fail, INF_3_1_0_fail, INF_3_1_400_fail, INF_3_1_1000_fail, EFF_1_1_0_fail, 
+                  EFF_1_1_400_fail, EFF_1_1_1000_fail, EFF_2_1_0_fail, EFF_2_1_400_fail, EFF_2_1_1000_fail, EFF_2_2_0_fail, EFF_2_2_400_fail, EFF_2_2_1000_fail, 
+                  EFF_2_3_0_fail, EFF_2_3_400_fail, EFF_2_3_1000_fail, EFF_3_1_0_fail, EFF_3_1_400_fail, EFF_3_1_1000_fail)
+model_names <- data.frame(c("INF_1_1_0_fail", "INF_1_1_400_fail", "INF_1_1_1000_fail", "INF_2_1_0_fail", "INF_2_1_400_fail", "INF_2_1_1000_fail", "INF_2_2_0_fail", 
+                            "INF_2_2_400_fail", "INF_2_2_1000_fail", "INF_2_3_0_fail", "INF_2_3_400_fail", "INF_2_3_1000_fail", "INF_3_1_0_fail", "INF_3_1_400_fail",
+                            "INF_3_1_1000_fail", "EFF_1_1_0_fail", "EFF_1_1_400_fail", "EFF_1_1_1000_fail", "EFF_2_1_0_fail", "EFF_2_1_400_fail", 
+                            "EFF_2_1_1000_fail", "EFF_2_2_0_fail", "EFF_2_2_400_fail", "EFF_2_2_1000_fail", "EFF_2_3_0_fail", "EFF_2_3_400_fail", 
+                            "EFF_2_3_1000_fail", "EFF_3_1_0_fail", "EFF_3_1_400_fail", "EFF_3_1_1000_fail"))
+model_info<- list(INF_1_1_0_fail_info, INF_1_1_400_fail_info, INF_1_1_1000_fail_info, INF_2_1_0_fail_info, INF_2_1_400_fail_info, INF_2_1_1000_fail_info, 
+                  INF_2_2_0_fail_info, INF_2_2_400_fail_info, INF_2_2_1000_fail_info, INF_2_3_0_fail_info, INF_2_3_400_fail_info, INF_2_3_1000_fail_info, 
+                  INF_3_1_0_fail_info, INF_3_1_400_fail_info, INF_3_1_1000_fail_info, EFF_1_1_0_fail_info, EFF_1_1_400_fail_info, EFF_1_1_1000_fail_info, 
+                  EFF_2_1_0_fail_info, EFF_2_1_400_fail_info, EFF_2_1_1000_fail_info, EFF_2_2_0_fail_info, EFF_2_2_400_fail_info, EFF_2_2_1000_fail_info, 
+                  EFF_2_3_0_fail_info, EFF_2_3_400_fail_info, EFF_2_3_1000_fail_info, EFF_3_1_0_fail_info, EFF_3_1_400_fail_info, EFF_3_1_1000_fail_info)
+minbp_model <- c(rep(min_bp, 10))
+
+
+for (i in 1:nrow(model_names)) {
+  a <- classify_targets(df_logreg[[i]], model_info[[i]], minbp_model[i])
+  
+  assign(model_names[i,], a)
+}
+```
+
+Create logistic regression models for each model data
+```{r}
+df_logreg <- list(INF_1_1_0, INF_1_1_400, INF_1_1_1000, INF_2_1_0, INF_2_1_400, INF_2_1_1000, INF_2_2_0, INF_2_2_400, INF_2_2_1000, INF_2_3_0, INF_2_3_400, 
+                  INF_2_3_1000, INF_3_1_0, INF_3_1_400, INF_3_1_1000, EFF_1_1_0, EFF_1_1_400, EFF_1_1_1000, EFF_2_1_0, EFF_2_1_400, EFF_2_1_1000, EFF_2_2_0,
+                  EFF_2_2_400, EFF_2_2_1000, EFF_2_3_0, EFF_2_3_400, EFF_2_3_1000, EFF_3_1_0, EFF_3_1_400, EFF_3_1_1000)
+model_names <- c("INF_1_1_0", "INF_1_1_400", "INF_1_1_1000", "INF_2_1_0", "INF_2_1_400", "INF_2_1_1000", "INF_2_2_0", "INF_2_2_400", "INF_2_2_1000", "INF_2_3_0",
+                 "INF_2_3_400", "INF_2_3_1000", "INF_3_1_0", "INF_3_1_400", "INF_3_1_1000", "EFF_1_1_0", "EFF_1_1_400", "EFF_1_1_1000", "EFF_2_1_0", "EFF_2_1_400",
+                 "EFF_2_1_1000", "EFF_2_2_0", "EFF_2_2_400", "EFF_2_2_1000", "EFF_2_3_0", "EFF_2_3_400", "EFF_2_3_1000", "EFF_3_1_0", "EFF_3_1_400", "EFF_3_1_1000")
+c = 1
+for (i in df_logreg) {
+  model <- glm(LOD ~ E_rel, data = i, family = binomial(link = "logit"))
+  
+  df_title = "sample.lr"
+  df_title = gsub("sample", model_names[c], df_title)
+  assign(df_title, model)
+  c = c + 1
+}
+```
+
+```{r}
+library(phylotools)
+standards_2 <- read.fasta("Map_Indexes/Langenfeld_2022_standards.fasta")
+
+for (i in 1:nrow(standards_2)) {
+  temp <- data.frame(strsplit(standards_2[[i,2]], ""))
+  colnames(temp) <- c("nucleic_acid")
+  temp$position <- c(1:nrow(temp))
+  temp$ID <- c(standards_2[[i,1]])
+  if (i == 1) {
+    standards <- temp
+  }
+  else {
+    standards <- rbind.data.frame(standards, temp)
+  }
+}
+
+standards$nucleic_acid[standards$nucleic_acid == "a"] <- "A"
+standards$nucleic_acid[standards$nucleic_acid == "t"] <- "T"
+standards$nucleic_acid[standards$nucleic_acid == "g"] <- "G"
+standards$nucleic_acid[standards$nucleic_acid == "c"] <- "C"
+
+write.table(standards, "Map_Indexes/Langenfeld_2022_standards.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+
+#fail_std_2 <- read.fasta("Mapping/contigs/EFF_3_1/standards_contigs.fasta")
+
+#for (i in 1:nrow(fail_std_2)) {
+#  temp <- data.frame(strsplit(fail_std_2[[i,2]], ""))
+#  colnames(temp) <- c("nucleic_acid")
+#  temp$position <- c(1:nrow(temp))
+#  temp$ID <- c(fail_std_2[[i,1]])
+#  if (i == 1) {
+#    fail_std <- temp
+#  }
+#  else {
+#    fail_std <- rbind.data.frame(fail_std, temp)
+#  }
+#}
+
+#fail_std$nucleic_acid[fail_std$nucleic_acid == "a"] <- "A"
+#fail_std$nucleic_acid[fail_std$nucleic_acid == "t"] <- "T"
+#fail_std$nucleic_acid[fail_std$nucleic_acid == "g"] <- "G"
+#fail_std$nucleic_acid[fail_std$nucleic_acid == "c"] <- "C"
+
+#write.table(fail_std, "mapping/contigs/EFF_3_1/standards_contigs.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+
+INF_2_1_map <- as.data.frame(read.table("Mapping/INF_2_1/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+INF_2_2_map <- as.data.frame(read.table("Mapping/INF_2_2/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+INF_2_3_map <- as.data.frame(read.table("Mapping/INF_2_3/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+colnames(INF_2_1_map) <- c("ID", "position", "INF_2_1_read_depth", "nucleic_acid")
+colnames(INF_2_2_map) <- c("ID", "position", "INF_2_2_read_depth", "nucleic_acid")
+colnames(INF_2_3_map) <- c("ID", "position", "INF_2_3_read_depth", "nucleic_acid")
+INF_2_all_map <- merge.data.frame(INF_2_1_map, INF_2_2_map, by = c("ID", "position"), all = TRUE)
+INF_2_all_map <- merge.data.frame(INF_2_all_map, INF_2_3_map, by = c("ID", "position"), all = TRUE)
+INF_2_all_map <- cbind.data.frame(INF_2_all_map$ID, INF_2_all_map$position, INF_2_all_map$nucleic_acid, INF_2_all_map$INF_2_1_read_depth, INF_2_all_map$INF_2_2_read_depth, INF_2_all_map$INF_2_3_read_depth)
+colnames(INF_2_all_map) <- c("ID", "position", "nucleic_acid", "INF_2_1_read_depth", "INF_2_2_read_depth", "INF_2_3_read_depth")
+INF_2_all_map$read_depth <- rowMeans(INF_2_all_map[4:6])
+INF_2_all_map <- cbind.data.frame(INF_2_all_map$ID, INF_2_all_map$position, INF_2_all_map$nucleic_acid, INF_2_all_map$read_depth)
+colnames(INF_2_all_map) <- c("ID", "position", "nucleic_acid", "read_depth")
+write.table(INF_2_all_map, "Mapping/INF_2_all/standards_mapping.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+
+INF_2_1_20_map <- as.data.frame(read.table("Mapping/INF_2_1_20/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+INF_2_2_20_map <- as.data.frame(read.table("Mapping/INF_2_2_20/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+INF_2_3_20_map <- as.data.frame(read.table("Mapping/INF_2_3_20/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+colnames(INF_2_1_20_map) <- c("ID", "position", "INF_2_1_20_read_depth", "nucleic_acid")
+colnames(INF_2_2_20_map) <- c("ID", "position", "INF_2_2_20_read_depth", "nucleic_acid")
+colnames(INF_2_3_20_map) <- c("ID", "position", "INF_2_3_20_read_depth", "nucleic_acid")
+INF_2_all_20_map <- merge.data.frame(INF_2_1_20_map, INF_2_2_20_map, by = c("ID", "position"), all = TRUE)
+INF_2_all_20_map <- merge.data.frame(INF_2_all_20_map, INF_2_3_20_map, by = c("ID", "position"), all = TRUE)
+INF_2_all_20_map <- cbind.data.frame(INF_2_all_20_map$ID, INF_2_all_20_map$position, INF_2_all_20_map$nucleic_acid, INF_2_all_20_map$INF_2_1_20_read_depth, INF_2_all_20_map$INF_2_2_20_read_depth, INF_2_all_20_map$INF_2_3_20_read_depth)
+colnames(INF_2_all_20_map) <- c("ID", "position", "nucleic_acid", "INF_2_1_20_read_depth", "INF_2_2_20_read_depth", "INF_2_3_20_read_depth")
+INF_2_all_20_map$read_depth <- rowMeans(INF_2_all_20_map[4:6])
+INF_2_all_20_map <- cbind.data.frame(INF_2_all_20_map$ID, INF_2_all_20_map$position, INF_2_all_20_map$nucleic_acid, INF_2_all_20_map$read_depth)
+colnames(INF_2_all_20_map) <- c("ID", "position", "nucleic_acid", "read_depth")
+write.table(INF_2_all_20_map, "Mapping/INF_2_all_20/standards_mapping.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+
+INF_2_1_1_map <- as.data.frame(read.table("Mapping/INF_2_1_1/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+INF_2_2_1_map <- as.data.frame(read.table("Mapping/INF_2_2_1/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+INF_2_3_1_map <- as.data.frame(read.table("Mapping/INF_2_3_1/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+colnames(INF_2_1_1_map) <- c("ID", "position", "INF_2_1_1_read_depth", "nucleic_acid")
+colnames(INF_2_2_1_map) <- c("ID", "position", "INF_2_2_1_read_depth", "nucleic_acid")
+colnames(INF_2_3_1_map) <- c("ID", "position", "INF_2_3_1_read_depth", "nucleic_acid")
+INF_2_all_1_map <- merge.data.frame(INF_2_1_1_map, INF_2_2_1_map, by = c("ID", "position"), all = TRUE)
+INF_2_all_1_map <- merge.data.frame(INF_2_all_1_map, INF_2_3_1_map, by = c("ID", "position"), all = TRUE)
+INF_2_all_1_map <- cbind.data.frame(INF_2_all_1_map$ID, INF_2_all_1_map$position, INF_2_all_1_map$nucleic_acid, INF_2_all_1_map$INF_2_1_1_read_depth, INF_2_all_1_map$INF_2_2_1_read_depth, INF_2_all_1_map$INF_2_3_1_read_depth)
+colnames(INF_2_all_1_map) <- c("ID", "position", "nucleic_acid", "INF_2_1_1_read_depth", "INF_2_2_1_read_depth", "INF_2_3_1_read_depth")
+INF_2_all_1_map$read_depth <- rowMeans(INF_2_all_1_map[4:6])
+INF_2_all_1_map <- cbind.data.frame(INF_2_all_1_map$ID, INF_2_all_1_map$position, INF_2_all_1_map$nucleic_acid, INF_2_all_1_map$read_depth)
+colnames(INF_2_all_1_map) <- c("ID", "position", "nucleic_acid", "read_depth")
+write.table(INF_2_all_1_map, "Mapping/INF_2_all_1/standards_mapping.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+
+EFF_2_1_map <- as.data.frame(read.table("Mapping/EFF_2_1/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+EFF_2_2_map <- as.data.frame(read.table("Mapping/EFF_2_2/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+EFF_2_3_map <- as.data.frame(read.table("Mapping/EFF_2_3/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+colnames(EFF_2_1_map) <- c("ID", "position", "EFF_2_1_read_depth", "nucleic_acid")
+colnames(EFF_2_2_map) <- c("ID", "position", "EFF_2_2_read_depth", "nucleic_acid")
+colnames(EFF_2_3_map) <- c("ID", "position", "EFF_2_3_read_depth", "nucleic_acid")
+EFF_2_all_map <- merge.data.frame(EFF_2_1_map, EFF_2_2_map, by = c("ID", "position"), all = TRUE)
+EFF_2_all_map <- merge.data.frame(EFF_2_all_map, EFF_2_3_map, by = c("ID", "position"), all = TRUE)
+EFF_2_all_map <- cbind.data.frame(EFF_2_all_map$ID, EFF_2_all_map$position, EFF_2_all_map$nucleic_acid, EFF_2_all_map$EFF_2_1_read_depth, EFF_2_all_map$EFF_2_2_read_depth, EFF_2_all_map$EFF_2_3_read_depth)
+colnames(EFF_2_all_map) <- c("ID", "position", "nucleic_acid", "EFF_2_1_read_depth", "EFF_2_2_read_depth", "EFF_2_3_read_depth")
+EFF_2_all_map$read_depth <- rowMeans(EFF_2_all_map[4:6])
+EFF_2_all_map <- cbind.data.frame(EFF_2_all_map$ID, EFF_2_all_map$position, EFF_2_all_map$nucleic_acid, EFF_2_all_map$read_depth)
+colnames(EFF_2_all_map) <- c("ID", "position", "nucleic_acid", "read_depth")
+write.table(EFF_2_all_map, "Mapping/EFF_2_all/standards_mapping.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+
+EFF_2_1_20_map <- as.data.frame(read.table("Mapping/EFF_2_1_20/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+EFF_2_2_20_map <- as.data.frame(read.table("Mapping/EFF_2_2_20/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+EFF_2_3_20_map <- as.data.frame(read.table("Mapping/EFF_2_3_20/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+colnames(EFF_2_1_20_map) <- c("ID", "position", "EFF_2_1_20_read_depth", "nucleic_acid")
+colnames(EFF_2_2_20_map) <- c("ID", "position", "EFF_2_2_20_read_depth", "nucleic_acid")
+colnames(EFF_2_3_20_map) <- c("ID", "position", "EFF_2_3_20_read_depth", "nucleic_acid")
+EFF_2_all_20_map <- merge.data.frame(EFF_2_1_20_map, EFF_2_2_20_map, by = c("ID", "position"), all = TRUE)
+EFF_2_all_20_map <- merge.data.frame(EFF_2_all_20_map, EFF_2_3_20_map, by = c("ID", "position"), all = TRUE)
+EFF_2_all_20_map <- cbind.data.frame(EFF_2_all_20_map$ID, EFF_2_all_20_map$position, EFF_2_all_20_map$nucleic_acid, EFF_2_all_20_map$EFF_2_1_20_read_depth, EFF_2_all_20_map$EFF_2_2_20_read_depth, EFF_2_all_20_map$EFF_2_3_20_read_depth)
+colnames(EFF_2_all_20_map) <- c("ID", "position", "nucleic_acid", "EFF_2_1_20_read_depth", "EFF_2_2_20_read_depth", "EFF_2_3_20_read_depth")
+EFF_2_all_20_map$read_depth <- rowMeans(EFF_2_all_20_map[4:6])
+EFF_2_all_20_map <- cbind.data.frame(EFF_2_all_20_map$ID, EFF_2_all_20_map$position, EFF_2_all_20_map$nucleic_acid, EFF_2_all_20_map$read_depth)
+colnames(EFF_2_all_20_map) <- c("ID", "position", "nucleic_acid", "read_depth")
+write.table(EFF_2_all_20_map, "Mapping/EFF_2_all_20/standards_mapping.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+
+EFF_2_1_1_map <- as.data.frame(read.table("Mapping/EFF_2_1_1/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+EFF_2_2_1_map <- as.data.frame(read.table("Mapping/EFF_2_2_1/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+EFF_2_3_1_map <- as.data.frame(read.table("Mapping/EFF_2_3_1/standards_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+colnames(EFF_2_1_1_map) <- c("ID", "position", "EFF_2_1_1_read_depth", "nucleic_acid")
+colnames(EFF_2_2_1_map) <- c("ID", "position", "EFF_2_2_1_read_depth", "nucleic_acid")
+colnames(EFF_2_3_1_map) <- c("ID", "position", "EFF_2_3_1_read_depth", "nucleic_acid")
+EFF_2_all_1_map <- merge.data.frame(EFF_2_1_1_map, EFF_2_2_1_map, by = c("ID", "position"), all = TRUE)
+EFF_2_all_1_map <- merge.data.frame(EFF_2_all_1_map, EFF_2_3_1_map, by = c("ID", "position"), all = TRUE)
+EFF_2_all_1_map <- cbind.data.frame(EFF_2_all_1_map$ID, EFF_2_all_1_map$position, EFF_2_all_1_map$nucleic_acid, EFF_2_all_1_map$EFF_2_1_1_read_depth, EFF_2_all_1_map$EFF_2_2_1_read_depth, EFF_2_all_1_map$EFF_2_3_1_read_depth)
+colnames(EFF_2_all_1_map) <- c("ID", "position", "nucleic_acid", "EFF_2_1_1_read_depth", "EFF_2_2_1_read_depth", "EFF_2_3_1_read_depth")
+EFF_2_all_1_map$read_depth <- rowMeans(EFF_2_all_1_map[4:6])
+EFF_2_all_1_map <- cbind.data.frame(EFF_2_all_1_map$ID, EFF_2_all_1_map$position, EFF_2_all_1_map$nucleic_acid, EFF_2_all_1_map$read_depth)
+colnames(EFF_2_all_1_map) <- c("ID", "position", "nucleic_acid", "read_depth")
+write.table(EFF_2_all_1_map, "Mapping/EFF_2_all_1/standards_mapping.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+
+samples <- c("INF_2_all", "EFF_2_all")
+
+for (j in min_bp) {
+  for (i in samples) {
+    filename = "Mapping/sample/standards_mapping.txt"
+    filename = gsub("sample", i, filename)
+    mapping_results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    mapping_results$position <- as.numeric(mapping_results$position)
+    mapping_results$read_depth <- as.numeric(mapping_results$read_depth)
+    mapping_results <- subset(mapping_results, !(is.na(read_depth)))
+    directory = "Mapping/sample/standards_minbp"
+    directory = gsub("sample", i, directory)
+    directory = gsub("minbp", j, directory)
+    mapping_target_analysis <- mapping_analysis(directory, mapping_results, STDS_list, j)
+    filename = "Mapping/sample/standards_minbp/standards_logit.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    all <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    all$downsample <- rep(100)
+    filename = "Mapping/sample/standards_minbp/standards_mapping_analysis.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    results$downsample <- rep(100)
+    all <- cbind.data.frame(all, results$gene_copies)
+    colnames(all) <- c("ID", "E_rel", "LOD", "downsample", "gene_copies")
+    
+    filename = "Mapping/sample_20/standards_mapping.txt"
+    filename = gsub("sample", i, filename)
+    mapping_results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    mapping_results$position <- as.numeric(mapping_results$position)
+    mapping_results$read_depth <- as.numeric(mapping_results$read_depth)
+    mapping_results <- subset(mapping_results, !(is.na(read_depth)))
+    directory = "Mapping/sample_20/standards_minbp"
+    directory = gsub("sample", i, directory)
+    directory = gsub("minbp", j, directory)
+    mapping_target_analysis <- mapping_analysis(directory, mapping_results, STDS_list, j)
+    filename = "Mapping/sample_20/standards_minbp/standards_logit.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    down <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    down$downsample <- rep(20)
+    filename = "Mapping/sample_20/standards_minbp/standards_mapping_analysis.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    results_2 <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    results_2$downsample <- rep(20)
+    down <- cbind.data.frame(down, results_2$gene_copies)
+    colnames(down) <- c("ID", "E_rel", "LOD", "downsample", "gene_copies")
+    
+    filename = "Mapping/sample_1/standards_mapping.txt"
+    filename = gsub("sample", i, filename)
+    mapping_results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    mapping_results$position <- as.numeric(mapping_results$position)
+    mapping_results$read_depth <- as.numeric(mapping_results$read_depth)
+    mapping_results <- subset(mapping_results, !(is.na(read_depth)))
+    directory = "Mapping/sample_1/standards_minbp"
+    directory = gsub("sample", i, directory)
+    directory = gsub("minbp", j, directory)
+    mapping_target_analysis <- mapping_analysis(directory, mapping_results, STDS_list, j)
+    filename = "Mapping/sample_1/standards_minbp/standards_logit.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    down1 <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    down1$downsample <- rep(1)
+    filename = "Mapping/sample_1/standards_minbp/standards_mapping_analysis.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    results_3 <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    results_3$downsample <- rep(1)
+    down1 <- cbind.data.frame(down1, results_3$gene_copies)
+    colnames(down1) <- c("ID", "E_rel", "LOD", "downsample", "gene_copies")
+    
+    all <- rbind.data.frame(all, down, down1)
+    results <- rbind.data.frame(results, results_2, results_3)
+    
+    df_title = "sample_minbp"
+    df_title = gsub("sample", i , df_title)
+    df_title = gsub("minbp", j, df_title)
+    assign(df_title, all)
+    
+    df_title = "sample_minbp_info"
+    df_title = gsub("sample", i, df_title)
+    df_title = gsub("minbp", j, df_title)
+    assign(df_title, results)
+  }
+}
+
+df_logreg <- list(INF_2_all_0, INF_2_all_400, INF_2_all_1000, EFF_2_all_0, EFF_2_all_400, EFF_2_all_1000)
+model_names <- data.frame(c("INF_2_all_0", "INF_2_all_400", "INF_2_all_1000", "EFF_2_all_0", "EFF_2_all_400", "EFF_2_all_1000"))
+model_info<- list(INF_2_all_0_info, INF_2_all_400_info, INF_2_all_1000_info, EFF_2_all_0_info, EFF_2_all_400_info, EFF_2_all_1000_info)
+minbp_model <- c(rep(min_bp, 2))
+
+for (i in 1:nrow(model_names)) {
+  a <- classify_targets(df_logreg[[i]], model_info[[i]], minbp_model[i])
+  
+  assign(model_names[i,], a)
+}
+```
+
+```{r}
+#INF_2_1_fail_map <- as.data.frame(read.table("mapping/INF_2_1/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+#INF_2_2_fail_map <- as.data.frame(read.table("mapping/INF_2_2/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+#INF_2_3_fail_map <- as.data.frame(read.table("mapping/INF_2_3/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+colnames(INF_2_1_fail_mapping) <- c("ID", "position", "INF_2_1_read_depth", "nucleic_acid")
+colnames(INF_2_2_fail_mapping) <- c("ID", "position", "INF_2_2_read_depth", "nucleic_acid")
+colnames(INF_2_3_fail_mapping) <- c("ID", "position", "INF_2_3_read_depth", "nucleic_acid")
+INF_2_all_fail_map <- merge.data.frame(INF_2_1_fail_mapping, INF_2_2_fail_mapping, by = c("ID", "position"), all = TRUE)
+INF_2_all_fail_map <- merge.data.frame(INF_2_all_fail_map, INF_2_3_fail_mapping, by = c("ID", "position"), all = TRUE)
+INF_2_all_fail_map <- cbind.data.frame(INF_2_all_fail_map$ID, INF_2_all_fail_map$position, INF_2_all_fail_map$nucleic_acid, INF_2_all_fail_map$INF_2_1_read_depth, INF_2_all_fail_map$INF_2_2_read_depth, INF_2_all_fail_map$INF_2_3_read_depth)
+colnames(INF_2_all_fail_map) <- c("ID", "position", "nucleic_acid", "INF_2_1_read_depth", "INF_2_2_read_depth", "INF_2_3_read_depth")
+INF_2_all_fail_map$read_depth <- rowMeans(INF_2_all_fail_map[4:6])
+INF_2_all_fail_map <- cbind.data.frame(INF_2_all_fail_map$ID, INF_2_all_fail_map$position, INF_2_all_fail_map$nucleic_acid, INF_2_all_fail_map$read_depth)
+colnames(INF_2_all_fail_map) <- c("ID", "position", "nucleic_acid", "read_depth")
+write.table(INF_2_all_fail_map, "Mapping/INF_2_all/fail_standards_mapping.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+
+#INF_2_1_20_fail_map <- as.data.frame(read.table("mapping/INF_2_1_20/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+#INF_2_2_20_fail_map <- as.data.frame(read.table("mapping/INF_2_2_20/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+#INF_2_3_20_fail_map <- as.data.frame(read.table("mapping/INF_2_3_20/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+colnames(INF_2_1_20_fail_mapping) <- c("ID", "position", "INF_2_1_20_read_depth", "nucleic_acid")
+colnames(INF_2_2_20_fail_mapping) <- c("ID", "position", "INF_2_2_20_read_depth", "nucleic_acid")
+colnames(INF_2_3_20_fail_mapping) <- c("ID", "position", "INF_2_3_20_read_depth", "nucleic_acid")
+INF_2_all_20_fail_map <- merge.data.frame(INF_2_1_20_fail_mapping, INF_2_2_20_fail_mapping, by = c("ID", "position"), all = TRUE)
+INF_2_all_20_fail_map <- merge.data.frame(INF_2_all_20_fail_map, INF_2_3_20_fail_mapping, by = c("ID", "position"), all = TRUE)
+INF_2_all_20_fail_map <- cbind.data.frame(INF_2_all_20_fail_map$ID, INF_2_all_20_fail_map$position, INF_2_all_20_fail_map$nucleic_acid, INF_2_all_20_fail_map$INF_2_1_20_read_depth, INF_2_all_20_fail_map$INF_2_2_20_read_depth, INF_2_all_20_fail_map$INF_2_3_20_read_depth)
+colnames(INF_2_all_20_fail_map) <- c("ID", "position", "nucleic_acid", "INF_2_1_20_read_depth", "INF_2_2_20_read_depth", "INF_2_3_20_read_depth")
+INF_2_all_20_fail_map$read_depth <- rowMeans(INF_2_all_20_fail_map[4:6])
+INF_2_all_20_fail_map <- cbind.data.frame(INF_2_all_20_fail_map$ID, INF_2_all_20_fail_map$position, INF_2_all_20_fail_map$nucleic_acid, INF_2_all_20_fail_map$read_depth)
+colnames(INF_2_all_20_fail_map) <- c("ID", "position", "nucleic_acid", "read_depth")
+write.table(INF_2_all_20_fail_map, "Mapping/INF_2_all_20/fail_standards_mapping.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+
+#INF_2_1_1_fail_map <- as.data.frame(read.table("mapping/INF_2_1_1/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+#INF_2_2_1_fail_map <- as.data.frame(read.table("mapping/INF_2_2_1/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+#INF_2_3_1_fail_map <- as.data.frame(read.table("mapping/INF_2_3_1/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+colnames(INF_2_1_1_fail_mapping) <- c("ID", "position", "INF_2_1_1_read_depth", "nucleic_acid")
+colnames(INF_2_2_1_fail_mapping) <- c("ID", "position", "INF_2_2_1_read_depth", "nucleic_acid")
+colnames(INF_2_3_1_fail_mapping) <- c("ID", "position", "INF_2_3_1_read_depth", "nucleic_acid")
+INF_2_all_1_fail_map <- merge.data.frame(INF_2_1_1_fail_mapping, INF_2_2_1_fail_mapping, by = c("ID", "position"), all = TRUE)
+INF_2_all_1_fail_map <- merge.data.frame(INF_2_all_1_fail_map, INF_2_3_1_fail_mapping, by = c("ID", "position"), all = TRUE)
+INF_2_all_1_fail_map <- cbind.data.frame(INF_2_all_1_fail_map$ID, INF_2_all_1_fail_map$position, INF_2_all_1_fail_map$nucleic_acid, INF_2_all_1_fail_map$INF_2_1_1_read_depth, INF_2_all_1_fail_map$INF_2_2_1_read_depth, INF_2_all_1_fail_map$INF_2_3_1_read_depth)
+colnames(INF_2_all_1_fail_map) <- c("ID", "position", "nucleic_acid", "INF_2_1_1_read_depth", "INF_2_2_1_read_depth", "INF_2_3_1_read_depth")
+INF_2_all_1_fail_map$read_depth <- rowMeans(INF_2_all_1_fail_map[4:6])
+INF_2_all_1_fail_map <- cbind.data.frame(INF_2_all_1_fail_map$ID, INF_2_all_1_fail_map$position, INF_2_all_1_fail_map$nucleic_acid, INF_2_all_1_fail_map$read_depth)
+colnames(INF_2_all_1_fail_map) <- c("ID", "position", "nucleic_acid", "read_depth")
+write.table(INF_2_all_1_fail_map, "Mapping/INF_2_all_1/fail_standards_mapping.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+
+#EFF_2_1_fail_map <- as.data.frame(read.table("mapping/EFF_2_1/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+#EFF_2_2_fail_map <- as.data.frame(read.table("mapping/EFF_2_2/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+#EFF_2_3_fail_map <- as.data.frame(read.table("mapping/EFF_2_3/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+colnames(EFF_2_1_fail_mapping) <- c("ID", "position", "EFF_2_1_read_depth", "nucleic_acid")
+colnames(EFF_2_2_fail_mapping) <- c("ID", "position", "EFF_2_2_read_depth", "nucleic_acid")
+colnames(EFF_2_3_fail_mapping) <- c("ID", "position", "EFF_2_3_read_depth", "nucleic_acid")
+EFF_2_all_fail_map <- merge.data.frame(EFF_2_1_fail_mapping, EFF_2_2_fail_mapping, by = c("ID", "position"), all = TRUE)
+EFF_2_all_fail_map <- merge.data.frame(EFF_2_all_fail_map, EFF_2_3_fail_mapping, by = c("ID", "position"), all = TRUE)
+EFF_2_all_fail_map <- cbind.data.frame(EFF_2_all_fail_map$ID, EFF_2_all_fail_map$position, EFF_2_all_fail_map$nucleic_acid, EFF_2_all_fail_map$EFF_2_1_read_depth, EFF_2_all_fail_map$EFF_2_2_read_depth, EFF_2_all_fail_map$EFF_2_3_read_depth)
+colnames(EFF_2_all_fail_map) <- c("ID", "position", "nucleic_acid", "EFF_2_1_read_depth", "EFF_2_2_read_depth", "EFF_2_3_read_depth")
+EFF_2_all_fail_map$read_depth <- rowMeans(EFF_2_all_fail_map[4:6])
+EFF_2_all_fail_map <- cbind.data.frame(EFF_2_all_fail_map$ID, EFF_2_all_fail_map$position, EFF_2_all_fail_map$nucleic_acid, EFF_2_all_fail_map$read_depth)
+colnames(EFF_2_all_fail_map) <- c("ID", "position", "nucleic_acid", "read_depth")
+write.table(EFF_2_all_fail_map, "Mapping/EFF_2_all/fail_standards_mapping.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+
+#EFF_2_1_20_fail_map <- as.data.frame(read.table("mapping/EFF_2_1_20/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+#EFF_2_2_20_fail_map <- as.data.frame(read.table("mapping/EFF_2_2_20/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+#EFF_2_3_20_fail_map <- as.data.frame(read.table("mapping/EFF_2_3_20/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+colnames(EFF_2_1_20_fail_mapping) <- c("ID", "position", "EFF_2_1_20_read_depth", "nucleic_acid")
+colnames(EFF_2_2_20_fail_mapping) <- c("ID", "position", "EFF_2_2_20_read_depth", "nucleic_acid")
+colnames(EFF_2_3_20_fail_mapping) <- c("ID", "position", "EFF_2_3_20_read_depth", "nucleic_acid")
+EFF_2_all_20_fail_map <- merge.data.frame(EFF_2_1_20_fail_mapping, EFF_2_2_20_fail_mapping, by = c("ID", "position"), all = TRUE)
+EFF_2_all_20_fail_map <- merge.data.frame(EFF_2_all_20_fail_map, EFF_2_3_20_fail_mapping, by = c("ID", "position"), all = TRUE)
+EFF_2_all_20_fail_map <- cbind.data.frame(EFF_2_all_20_fail_map$ID, EFF_2_all_20_fail_map$position, EFF_2_all_20_fail_map$nucleic_acid, EFF_2_all_20_fail_map$EFF_2_1_20_read_depth, EFF_2_all_20_fail_map$EFF_2_2_20_read_depth, EFF_2_all_20_fail_map$EFF_2_3_20_read_depth)
+colnames(EFF_2_all_20_fail_map) <- c("ID", "position", "nucleic_acid", "EFF_2_1_20_read_depth", "EFF_2_2_20_read_depth", "EFF_2_3_20_read_depth")
+EFF_2_all_20_fail_map$read_depth <- rowMeans(EFF_2_all_20_fail_map[4:6])
+EFF_2_all_20_fail_map <- cbind.data.frame(EFF_2_all_20_fail_map$ID, EFF_2_all_20_fail_map$position, EFF_2_all_20_fail_map$nucleic_acid, EFF_2_all_20_fail_map$read_depth)
+colnames(EFF_2_all_20_fail_map) <- c("ID", "position", "nucleic_acid", "read_depth")
+write.table(EFF_2_all_20_fail_map, "Mapping/EFF_2_all_20/fail_standards_mapping.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+
+#EFF_2_1_1_fail_map <- as.data.frame(read.table("mapping/EFF_2_1_1/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+#EFF_2_2_1_fail_map <- as.data.frame(read.table("mapping/EFF_2_2_1/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+#EFF_2_3_1_fail_map <- as.data.frame(read.table("mapping/EFF_2_3_1/fail_standards_v3_mapping.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+colnames(EFF_2_1_1_fail_mapping) <- c("ID", "position", "EFF_2_1_1_read_depth", "nucleic_acid")
+colnames(EFF_2_2_1_fail_mapping) <- c("ID", "position", "EFF_2_2_1_read_depth", "nucleic_acid")
+colnames(EFF_2_3_1_fail_mapping) <- c("ID", "position", "EFF_2_3_1_read_depth", "nucleic_acid")
+EFF_2_all_1_fail_map <- merge.data.frame(EFF_2_1_1_fail_mapping, EFF_2_2_1_fail_mapping, by = c("ID", "position"), all = TRUE)
+EFF_2_all_1_fail_map <- merge.data.frame(EFF_2_all_1_fail_map, EFF_2_3_1_fail_mapping, by = c("ID", "position"), all = TRUE)
+EFF_2_all_1_fail_map <- cbind.data.frame(EFF_2_all_1_fail_map$ID, EFF_2_all_1_fail_map$position, EFF_2_all_1_fail_map$nucleic_acid, EFF_2_all_1_fail_map$EFF_2_1_1_read_depth, EFF_2_all_1_fail_map$EFF_2_2_1_read_depth, EFF_2_all_1_fail_map$EFF_2_3_1_read_depth)
+colnames(EFF_2_all_1_fail_map) <- c("ID", "position", "nucleic_acid", "EFF_2_1_1_read_depth", "EFF_2_2_1_read_depth", "EFF_2_3_1_read_depth")
+EFF_2_all_1_fail_map$read_depth <- rowMeans(EFF_2_all_1_fail_map[4:6])
+EFF_2_all_1_fail_map <- cbind.data.frame(EFF_2_all_1_fail_map$ID, EFF_2_all_1_fail_map$position, EFF_2_all_1_fail_map$nucleic_acid, EFF_2_all_1_fail_map$read_depth)
+colnames(EFF_2_all_1_fail_map) <- c("ID", "position", "nucleic_acid", "read_depth")
+write.table(EFF_2_all_1_fail_map, "Mapping/EFF_2_all_1/fail_standards_mapping.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+
+samples <- c("INF_2_all", "EFF_2_all")
+min_bp <- c(0, 400, 1000)
+for (j in min_bp) {
+  for (i in samples) {
+    filename = "Mapping/sample/fail_standards_mapping.txt"
+    filename = gsub("sample", i, filename)
+    mapping_results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    mapping_results$position <- as.numeric(mapping_results$position)
+    mapping_results$read_depth <- as.numeric(mapping_results$read_depth)
+    mapping_results <- subset(mapping_results, !(is.na(read_depth)))
+    directory = "Mapping/sample/fail_standards_minbp"
+    directory = gsub("sample", i, directory)
+    directory = gsub("minbp", j, directory)
+    mapping_target_analysis <- mapping_analysis(directory, mapping_results, F_STDS_list, j)
+    filename = "Mapping/sample/fail_standards_minbp/standards_logit.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    all <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    all$downsample <- rep(100)
+    filename = "Mapping/sample/fail_standards_minbp/standards_mapping_analysis.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    results$downsample <- rep(100)
+    all <- cbind.data.frame(all, results$gene_copies)
+    colnames(all) <- c("ID", "E_rel", "LOD", "downsample", "gene_copies")
+    
+    filename = "Mapping/sample_20/fail_standards_mapping.txt"
+    filename = gsub("sample", i, filename)
+    mapping_results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    mapping_results$position <- as.numeric(mapping_results$position)
+    mapping_results$read_depth <- as.numeric(mapping_results$read_depth)
+    mapping_results <- subset(mapping_results, !(is.na(read_depth)))
+    directory = "Mapping/sample_20/fail_standards_minbp"
+    directory = gsub("sample", i, directory)
+    directory = gsub("minbp", j, directory)
+    mapping_target_analysis <- mapping_analysis(directory, mapping_results, F_STDS_list, j)
+    filename = "Mapping/sample_20/fail_standards_minbp/standards_logit.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    down <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    down$downsample <- rep(20)
+    filename = "Mapping/sample_20/fail_standards_minbp/standards_mapping_analysis.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    results_2 <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    results_2$downsample <- rep(20)
+    down <- cbind.data.frame(down, results_2$gene_copies)
+    colnames(down) <- c("ID", "E_rel", "LOD", "downsample", "gene_copies")
+    
+    filename = "Mapping/sample_1/fail_standards_mapping.txt"
+    filename = gsub("sample", i, filename)
+    mapping_results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    mapping_results$position <- as.numeric(mapping_results$position)
+    mapping_results$read_depth <- as.numeric(mapping_results$read_depth)
+    mapping_results <- subset(mapping_results, !(is.na(read_depth)))
+    directory = "Mapping/sample_1/fail_standards_minbp"
+    directory = gsub("sample", i, directory)
+    directory = gsub("minbp", j, directory)
+    mapping_target_analysis <- mapping_analysis(directory, mapping_results, F_STDS_list, j)
+    filename = "Mapping/sample_1/fail_standards_minbp/standards_logit.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    down1 <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    down1$downsample <- rep(1)
+    filename = "Mapping/sample_1/fail_standards_minbp/standards_mapping_analysis.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    results_3 <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    results_3$downsample <- rep(1)
+    down1 <- cbind.data.frame(down1, results_3$gene_copies)
+    colnames(down1) <- c("ID", "E_rel", "LOD", "downsample", "gene_copies")
+    
+    all <- rbind.data.frame(all, down, down1)
+    results <- rbind.data.frame(results, results_2, results_3)
+    
+    df_title = "sample_minbp_fail"
+    df_title = gsub("sample", i , df_title)
+    df_title = gsub("minbp", j, df_title)
+    assign(df_title, all)
+    
+    df_title = "sample_minbp_fail_info"
+    df_title = gsub("sample", i, df_title)
+    df_title = gsub("minbp", j, df_title)
+    assign(df_title, results)
+  }
+}
+
+df_logreg <- list(INF_2_all_0_fail, INF_2_all_400_fail, INF_2_all_1000_fail, EFF_2_all_0_fail, EFF_2_all_400_fail, EFF_2_all_1000_fail)
+model_names <- data.frame(c("INF_2_all_0_fail", "INF_2_all_400_fail", "INF_2_all_1000_fail", "EFF_2_all_0_fail", "EFF_2_all_400_fail", "EFF_2_all_1000_fail"))
+model_info<- list(INF_2_all_0_fail_info, INF_2_all_400_fail_info, INF_2_all_1000_fail_info, EFF_2_all_0_fail_info, EFF_2_all_400_fail_info, EFF_2_all_1000_fail_info)
+minbp_model <- c(rep(min_bp, 2))
+
+for (i in 1:nrow(model_names)) {
+  a <- classify_targets(df_logreg[[i]], model_info[[i]], minbp_model[i])
+  
+  assign(model_names[i,], a)
+}
+```
+
+
+PERMANOVA -- do the different technical replicates have significantly different concentrations of standards? (ONLY looking at the relative abundance concentrations in each metagenome)
+```{r}
+library(vegan)
+
+temp <- cbind.data.frame("ID"=subset(INF_2_1_0, downsample == 100)$ID, "INF_2_1"=as.numeric(subset(INF_2_1_0, downsample == 100)$gene_copies))
+temp1 <- cbind.data.frame("ID"=subset(INF_2_2_0, downsample == 100)$ID, "INF_2_2"=as.numeric(subset(INF_2_2_0, downsample == 100)$gene_copies))
+temp2 <- cbind.data.frame("ID"=subset(INF_2_3_0, downsample == 100)$ID, "INF_2_3"=as.numeric(subset(INF_2_3_0, downsample == 100)$gene_copies))
+INF_2_conc <- merge.data.frame(temp, temp1, by = c("ID"), all = TRUE)
+INF_2_conc <- merge.data.frame(INF_2_conc, temp2, by = c("ID"), all = TRUE)
+rownames(INF_2_conc) <- INF_2_conc[,1]
+INF_2_conc <- INF_2_conc[,-1]
+INF_2_conc[is.na(INF_2_conc[])] <- 0
+
+INF_2_conc_matrix <- as.matrix(INF_2_conc)
+INF_2_conc_matrix <- t(INF_2_conc_matrix)
+
+dist <- vegdist(INF_2_conc_matrix, method="bray")
+
+dist2 <- as.matrix(dist)
+dist2 <- cbind.data.frame("replicate"=c(1,2,3), dist2)
+
+replicate <- adonis2(dist~replicate, data = dist2, permutations = 10)
+
+replicate_p <- numeric()
+replicate_p["Influent"] <- replicate[["Pr(>F)"]][1]
+
+
+temp <- cbind.data.frame("ID"=subset(EFF_2_1_0, downsample == 100)$ID, "EFF_2_1"=as.numeric(subset(EFF_2_1_0, downsample == 100)$gene_copies))
+temp1 <- cbind.data.frame("ID"=subset(EFF_2_2_0, downsample == 100)$ID, "EFF_2_2"=as.numeric(subset(EFF_2_2_0, downsample == 100)$gene_copies))
+temp2 <- cbind.data.frame("ID"=subset(EFF_2_3_0, downsample == 100)$ID, "EFF_2_3"=as.numeric(subset(EFF_2_3_0, downsample == 100)$gene_copies))
+EFF_2_conc <- merge.data.frame(temp, temp1, by = c("ID"), all = TRUE)
+EFF_2_conc <- merge.data.frame(EFF_2_conc, temp2, by = c("ID"), all = TRUE)
+rownames(EFF_2_conc) <- EFF_2_conc[,1]
+EFF_2_conc <- EFF_2_conc[,-1]
+EFF_2_conc[is.na(EFF_2_conc[])] <- 0
+
+EFF_2_conc_matrix <- as.matrix(EFF_2_conc)
+EFF_2_conc_matrix <- t(EFF_2_conc_matrix)
+
+dist <- vegdist(EFF_2_conc_matrix, method="bray")
+
+dist3 <- as.matrix(dist)
+dist3 <- cbind.data.frame("replicate"=c(1,2,3), dist3)
+
+replicate2 <- adonis2(dist~replicate, data = dist3, permutations = 10)
+
+replicate_p["Effluent"] <- replicate2[["Pr(>F)"]][1]
+
+p.adjust(replicate_p, method = "BH")
+```
+
+
+Logistic regression combining all samples
+```{r}
+model_all_0 <- rbind.data.frame(INF_1_1_0, INF_2_all_0, INF_3_1_0, EFF_1_1_0, EFF_2_all_0, EFF_3_1_0, subset(INF_1_1_0_fail, LOD == 0), subset(INF_2_all_0_fail, LOD == 0), subset(INF_3_1_0_fail, LOD == 0), subset(EFF_1_1_0_fail, LOD == 0), subset(EFF_2_all_0_fail, LOD == 0), subset(EFF_3_1_0_fail, LOD == 0))
+model_all_400 <- rbind.data.frame(INF_1_1_400, INF_2_all_400, INF_3_1_400, EFF_1_1_400, EFF_2_all_400, EFF_3_1_400, subset(INF_1_1_400_fail, LOD == 0), subset(INF_2_all_400_fail, LOD == 0), subset(INF_3_1_400_fail, LOD == 0), subset(EFF_1_1_400_fail, LOD == 0), subset(EFF_2_all_400_fail, LOD == 0), subset(EFF_3_1_400_fail, LOD == 0))
+model_all_1000 <- rbind.data.frame(INF_1_1_1000, INF_2_all_1000, INF_3_1_1000, EFF_1_1_1000, EFF_2_all_1000, EFF_3_1_1000, subset(INF_1_1_1000_fail, LOD == 0), subset(INF_2_all_1000_fail, LOD == 0), subset(INF_3_1_1000_fail, LOD == 0), subset(EFF_1_1_1000_fail, LOD == 0), subset(EFF_2_all_1000_fail, LOD == 0), subset(EFF_3_1_1000_fail, LOD == 0))
+
+all_0.lr <- glm(LOD ~ E_rel, data = model_all_0, family = binomial(link = "logit"))
+all_400.lr <- glm(LOD ~ E_rel, data = model_all_400, family = binomial(link = "logit"))
+all_1000.lr <- glm(LOD ~ E_rel, data = model_all_1000, family = binomial(link = "logit"))
+```
+
+```{r}
+logreg_test <- function(sample_model, test_data) {
+  test_data$above_LOD <- rep("above_LOD")
+  test_data$above_LOD[test_data$LOD == 0] <- "below_LOD"
+  test_data$E_rel <- as.numeric(as.character(test_data$E_rel))
+  test_data <- cbind.data.frame(test_data, predict(sample_model, newdata = test_data, type = "link", se = TRUE))
+  test_data <- within(test_data, {
+    PredictedProb <- plogis(fit)
+    LL <- plogis(fit - (1.96 * se.fit))
+    UL <- plogis(fit + (1.96 * se.fit))
+  })
+  return(test_data)
+}
+
+logreg_assess <- function(test_data, sample_name) {
+  assessment <- data.frame(sample_name)
+  cp <- cutpointr(test_data, E_rel, above_LOD, method = maximize_boot_metric, metric = sum_sens_spec)
+  assessment$ROC_AUC = cp$AUC
+  assessment$optimal_cutpoint = cp$optimal_cutpoint
+  colnames(assessment) <- c("sample", "ROC_AUC", "optimal_cutpoint")
+  return(assessment)
+}
+```
+
+
+Determine coverage, average read depth (i.e. gene copies), and LOD parameters of each target
+```{r}
+mapping_analysis <- function(sample_name, mapping_results, target_lengths, min_bp, target_name) {
+  # make a list of the standards ID in the mapping file
+  targets = data.frame(unique(mapping_results$ID))
+  colnames(targets) <- "ID"
+  targets <- merge.data.frame(targets, target_lengths, by = "ID")
+  colnames(targets) <- c("ID", "length")
+  targets$cover_count <- 0
+  targets$B_G <- 0
+  targets$gene_copies <- 0
+  targets$I_G <- 0
+  targets$E_rel <- 0
+  targets$C_o <- 0
+  targets$C_e <- 0
+  targets$R_FVE <- 0
+  targets$LOD <- 0
+  
+  for(i in 1:nrow(targets)) {
+    # select genome information on specific genome from mapping table
+    target = subset(mapping_results, ID == targets$ID[i])
+    target$I_G_x <- 0
+    targets$cover_count[i] = nrow(subset(target, read_depth > 0))
+    
+    # Calculate total number of bases mapping to genome and the average read depth (gene copies)
+    targets$B_G[i] = sum(target$read_depth)
+    targets$gene_copies[i] = mean(target$read_depth)
+    
+    # Calculate I_G and number of positions covered by at least 1 read
+    target$I_G_x <- (target$read_depth/targets$B_G[i])*log(target$read_depth/targets$B_G[i])
+    targets$I_G[i] <- -sum(na.omit(target$I_G_x))
+    
+    # Calculate E_rel
+    targets$E_rel[i] = targets$I_G[i]/log(targets$length[i])
+    
+    # FastViromeExplorer LOD parameters
+    targets$C_o[i] = targets$cover_count[i]/targets$length[i]
+    targets$C_e[i] = 1 - exp(-targets$B_G[i]/targets$length[i])
+    if(targets$C_e[i] != 0) {
+      targets$R_FVE[i] = targets$C_o[i]/targets$C_e[i]
+    }
+    if(targets$C_o[i] > 0.1 & targets$R_FVE[i] > 0.3 & targets$B_G[i] > min_bp) {
+      targets$LOD[i] = 1 # Passed LOD requirement
+    }
+    if(!(targets$C_o[i] > 0.1 & targets$R_FVE[i] > 0.3 & targets$B_G[i] > min_bp)) {
+      targets$LOD[i] = 0 # Failed LOD requirement
+    }
+  }
+  
+  mapping_targets_logit = data.frame(cbind(targets$ID, targets$E_rel, targets$LOD))
+  colnames(mapping_targets_logit) <- c("ID", "E_rel", "LOD")
+  mapping_targets_analysis = data.frame(cbind(targets$ID, targets$E_rel, targets$C_o, targets$R_FVE, targets$B_G, targets$gene_copies))
+  colnames(mapping_targets_analysis) <- c("ID", "E_rel", "C_o", "R_FVE", "B_G", "gene_copies")
+  
+  output = "sample/targ_mapping_analysis.txt"
+  output = gsub("sample", sample_name, output)
+  output = gsub("targ", target_name, output)
+  write.table(mapping_targets_analysis, file = output, append = FALSE, sep = "\t", row.names = FALSE, col.names = TRUE)
+  output2 = "sample/targ_logit.txt"
+  output2 = gsub("sample", sample_name, output2)
+  output2 = gsub("targ", target_name, output2)
+  write.table(mapping_targets_logit, file = output2, append = FALSE, sep = "\t", row.names = FALSE, col.names = TRUE)
+  
+  return(mapping_targets_analysis)
+} 
+```
+
+
+Calculate logit for NCBI viral GENE database mapping test dataset
+```{r}
+targets <- as.data.frame(read.table("Map_Indexes/NCBI_viral_genes_length.txt", sep = "\t", header = FALSE, stringsAsFactors = FALSE))
+colnames(targets) <- c("ID", "length")
+
+samples <- c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1", "EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1")
+#samples <- c("EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1")
+min_bp <- c(0, 400, 1000)
+#min_bp <- c(400)
+
+for (j in min_bp) {
+  for (i in samples) {
+    filename = "Mapping/sample/NCBI_viral_genes_mapping.txt"
+    filename = gsub("sample", i, filename)
+    mapping_results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    mapping_results[is.na(mapping_results)] <- 0
+    directory = "Mapping/sample/datasets_minbp"
+    directory = gsub("sample", i, directory)
+    directory = gsub("minbp", j, directory)
+    #mapping_target_analysis <- mapping_analysis(directory, mapping_results, targets, j, "NCBI_viral_genes")
+    filename = "Mapping/sample/datasets_minbp/NCBI_viral_genes_logit.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    all <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    filename = "Mapping/sample/datasets_minbp/NCBI_viral_genes_mapping_analysis.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    all <- cbind.data.frame(all, results$gene_copies)
+    colnames(all) <- c("ID", "E_rel", "LOD", "gene_copies")
+    
+    df_title = "NCBI_genes_sample_minbp"
+    df_title = gsub("sample", i , df_title)
+    df_title = gsub("minbp", j, df_title)
+    assign(df_title, all)
+    
+    df_title = "NCBI_genes_sample_minbp_info"
+    df_title = gsub("sample", i, df_title)
+    df_title = gsub("minbp", j, df_title)
+    assign(df_title, results)
+  }
+}
+
+NCBI_genes_test <- list(NCBI_genes_INF_1_1_0, NCBI_genes_INF_1_1_400, NCBI_genes_INF_1_1_1000, NCBI_genes_INF_2_1_0, NCBI_genes_INF_2_1_400, NCBI_genes_INF_2_1_1000,
+                  NCBI_genes_INF_2_2_0, NCBI_genes_INF_2_2_400, NCBI_genes_INF_2_2_1000, NCBI_genes_INF_2_3_0, NCBI_genes_INF_2_3_400, NCBI_genes_INF_2_3_1000,
+                  NCBI_genes_INF_3_1_0, NCBI_genes_INF_3_1_400, NCBI_genes_INF_3_1_1000, NCBI_genes_EFF_1_1_0, NCBI_genes_EFF_1_1_400, NCBI_genes_EFF_1_1_1000,
+                  NCBI_genes_EFF_2_1_0, NCBI_genes_EFF_2_1_400, NCBI_genes_EFF_2_1_1000, NCBI_genes_EFF_2_2_0, NCBI_genes_EFF_2_2_400, NCBI_genes_EFF_2_2_1000,
+                  NCBI_genes_EFF_2_3_0, NCBI_genes_EFF_2_3_400, NCBI_genes_EFF_2_3_1000, NCBI_genes_EFF_3_1_0, NCBI_genes_EFF_3_1_400, NCBI_genes_EFF_3_1_1000)
+NCBI_genes_names <- data.frame(c("NCBI_genes_INF_1_1_0", "NCBI_genes_INF_1_1_400", "NCBI_genes_INF_1_1_1000", "NCBI_genes_INF_2_1_0", "NCBI_genes_INF_2_1_400",
+                            "NCBI_genes_INF_2_1_1000", "NCBI_genes_INF_2_2_0", "NCBI_genes_INF_2_2_400", "NCBI_genes_INF_2_2_1000", "NCBI_genes_INF_2_3_0",
+                            "NCBI_genes_INF_2_3_400", "NCBI_genes_INF_2_3_1000", "NCBI_genes_INF_3_1_0", "NCBI_genes_INF_3_1_400", "NCBI_genes_INF_3_1_1000",
+                            "NCBI_genes_EFF_1_1_0", "NCBI_genes_EFF_1_1_400", "NCBI_genes_EFF_1_1_1000", "NCBI_genes_EFF_2_1_0", "NCBI_genes_EFF_2_1_400",
+                            "NCBI_genes_EFF_2_1_1000", "NCBI_genes_EFF_2_2_0", "NCBI_genes_EFF_2_2_400", "NCBI_genes_EFF_2_2_1000", "NCBI_genes_EFF_2_3_0",
+                            "NCBI_genes_EFF_2_3_400", "NCBI_genes_EFF_2_3_1000", "NCBI_genes_EFF_3_1_0", "NCBI_genes_EFF_3_1_400", "NCBI_genes_EFF_3_1_1000"))
+NCBI_genes_info<- list(NCBI_genes_INF_1_1_0_info, NCBI_genes_INF_1_1_400_info, NCBI_genes_INF_1_1_1000_info, 
+                       NCBI_genes_INF_2_1_0_info, NCBI_genes_INF_2_1_400_info, NCBI_genes_INF_2_1_1000_info, 
+                       NCBI_genes_INF_2_2_0_info, NCBI_genes_INF_2_2_400_info, NCBI_genes_INF_2_2_1000_info, 
+                       NCBI_genes_INF_2_3_0_info, NCBI_genes_INF_2_3_400_info, NCBI_genes_INF_2_3_1000_info,
+                       NCBI_genes_INF_3_1_0_info, NCBI_genes_INF_3_1_400_info, NCBI_genes_INF_3_1_1000_info, 
+                       NCBI_genes_EFF_1_1_0_info, NCBI_genes_EFF_1_1_400_info, NCBI_genes_EFF_1_1_1000_info, 
+                       NCBI_genes_EFF_2_1_0_info, NCBI_genes_EFF_2_1_400_info, NCBI_genes_EFF_2_1_1000_info, 
+                       NCBI_genes_EFF_2_2_0_info, NCBI_genes_EFF_2_2_400_info, NCBI_genes_EFF_2_2_1000_info, 
+                       NCBI_genes_EFF_2_3_0_info, NCBI_genes_EFF_2_3_400_info, NCBI_genes_EFF_2_3_1000_info, 
+                       NCBI_genes_EFF_3_1_0_info, NCBI_genes_EFF_3_1_400_info, NCBI_genes_EFF_3_1_1000_info)
+NCBI_genes_minbp <- rep(min_bp, 10)
+
+df_models <- c(rep(list(all_0.lr, all_400.lr, all_1000.lr), 10))
+c = 1
+for (i in NCBI_genes_test) {
+  i <- logreg_test(df_models[[c]], i)
+  if (c == 1) {
+    NCBI_genes_results <- logreg_assess(i, NCBI_genes_names[c,1])
+  }
+  else {
+    NCBI_genes_results <- rbind.data.frame(NCBI_genes_results, logreg_assess(i, NCBI_genes_names[c,1]))
+  }
+  
+  assign(NCBI_genes_names[c,1], i)
+  c = c + 1
+}
+
+colnames(NCBI_genes_results) <- c("sample", "AUC", "E_rel")
+NCBI_genes_results$fit <- 0
+NCBI_genes_results$se.fit <- 0
+NCBI_genes_results$residual.scale <- 0
+NCBI_genes_results$UL <- 0
+NCBI_genes_results$LL <- 0
+NCBI_genes_results$PredictedProb <- 0
+
+for (i in 1:nrow(NCBI_genes_results)) {
+  NCBI_genes_results[i,4:6] <- predict(df_models[[i]], newdata = NCBI_genes_results[i,], type = "link", se = TRUE)
+  NCBI_genes_results[i,] <- within(NCBI_genes_results[i,], {
+    PredictedProb <- plogis(fit)
+    LL <- plogis(fit - (1.96 * se.fit))
+    UL <- plogis(fit + (1.96 * se.fit))
+  })
+}
+
+for (i in 1:nrow(NCBI_genes_names)) {
+  a <- classify_targets(NCBI_genes_test[[i]], NCBI_genes_info[[i]], NCBI_genes_minbp[i])
+  
+  assign(NCBI_genes_names[i,], a)
+}
+
+```
+
+Calculate logit for NCBI viral database mapping test dataset
+```{r}
+targets <- as.data.frame(read.table("Map_Indexes/NCBI_viral_length.txt", sep = "\t", header = FALSE, stringsAsFactors = FALSE))
+colnames(targets) <- c("ID", "length")
+
+for (j in min_bp) {
+  for (i in samples) {
+    filename = "Mapping/sample/NCBI_viral_mapping.txt"
+    filename = gsub("sample", i, filename)
+    mapping_results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    directory = "Mapping/sample/datasets_minbp"
+    directory = gsub("sample", i, directory)
+    directory = gsub("minbp", j, directory)
+    #mapping_target_analysis <- mapping_analysis(directory, mapping_results, targets, j, "NCBI_viral")
+    filename = "Mapping/sample/datasets_minbp/NCBI_viral_logit.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    all <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    filename = "Mapping/sample/datasets_minbp/NCBI_viral_mapping_analysis.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    all <- cbind.data.frame(all, results$gene_copies)
+    colnames(all) <- c("ID", "E_rel", "LOD", "gene_copies")
+    
+    df_title = "NCBI_sample_minbp"
+    df_title = gsub("sample", i , df_title)
+    df_title = gsub("minbp", j, df_title)
+    assign(df_title, all)
+    
+    df_title = "NCBI_sample_minbp_info"
+    df_title = gsub("sample", i, df_title)
+    df_title = gsub("minbp", j, df_title)
+    assign(df_title, results)
+  }
+}
+```
+
+Repeat above with the VirSorter database
+```{r}
+targets <- as.data.frame(read.table("Map_Indexes/VirSorter_curated_db_length.txt", sep = "\t", header = FALSE, stringsAsFactors = FALSE))
+colnames(targets) <- c("ID", "length")
+
+for (j in min_bp) {
+  for (i in samples) {
+    filename = "Mapping/sample/VirSorter_curated_db_mapping.txt"
+    filename = gsub("sample", i, filename)
+    mapping_results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    directory = "Mapping/sample/datasets_minbp"
+    directory = gsub("sample", i, directory)
+    directory = gsub("minbp", j, directory)
+    #mapping_target_analysis <- mapping_analysis(directory, mapping_results, targets, j, "VirSorter_curated_db")
+    filename = "Mapping/sample/datasets_minbp/VirSorter_curated_db_logit.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    all <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    filename = "Mapping/sample/datasets_minbp/VirSorter_curated_db_mapping_analysis.txt"
+    filename = gsub("sample", i, filename)
+    filename = gsub("minbp", j, filename)
+    results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+    all <- cbind.data.frame(all, results$gene_copies)
+    colnames(all) <- c("ID", "E_rel", "LOD", "gene_copies")
+    
+    df_title = "VirSorter_sample_minbp"
+    df_title = gsub("sample", i , df_title)
+    df_title = gsub("minbp", j, df_title)
+    assign(df_title, all)
+    
+    df_title = "VirSorter_sample_minbp_info"
+    df_title = gsub("sample", i, df_title)
+    df_title = gsub("minbp", j, df_title)
+    assign(df_title, results)
+  }
+}
+```
+
+Calculate the cutpoint and the AUC for each logistic regression model and test data set
+```{r}
+NCBI_test <- list(NCBI_INF_1_1_0, NCBI_INF_1_1_400, NCBI_INF_1_1_1000, NCBI_INF_2_1_0, NCBI_INF_2_1_400, NCBI_INF_2_1_1000, NCBI_INF_2_2_0, NCBI_INF_2_2_400, 
+                  NCBI_INF_2_2_1000, NCBI_INF_2_3_0, NCBI_INF_2_3_400, NCBI_INF_2_3_1000, NCBI_INF_3_1_0, NCBI_INF_3_1_400, NCBI_INF_3_1_1000, NCBI_EFF_1_1_0, 
+                  NCBI_EFF_1_1_400, NCBI_EFF_1_1_1000, NCBI_EFF_2_1_0, NCBI_EFF_2_1_400, NCBI_EFF_2_1_1000, NCBI_EFF_2_2_0, NCBI_EFF_2_2_400, NCBI_EFF_2_2_1000,
+                  NCBI_EFF_2_3_0, NCBI_EFF_2_3_400, NCBI_EFF_2_3_1000, NCBI_EFF_3_1_0, NCBI_EFF_3_1_400, NCBI_EFF_3_1_1000)
+NCBI_info <- list(NCBI_INF_1_1_0_info, NCBI_INF_1_1_400_info, NCBI_INF_1_1_1000_info, NCBI_INF_2_1_0_info, NCBI_INF_2_1_400_info, NCBI_INF_2_1_1000_info, 
+                  NCBI_INF_2_2_0_info, NCBI_INF_2_2_400_info, NCBI_INF_2_2_1000_info, NCBI_INF_2_3_0_info, NCBI_INF_2_3_400_info, NCBI_INF_2_3_1000_info, 
+                  NCBI_INF_3_1_0_info, NCBI_INF_3_1_400_info, NCBI_INF_3_1_1000_info, NCBI_EFF_1_1_0_info, NCBI_EFF_1_1_400_info, NCBI_EFF_1_1_1000_info, 
+                  NCBI_EFF_2_1_0_info, NCBI_EFF_2_1_400_info, NCBI_EFF_2_1_1000_info, NCBI_EFF_2_2_0_info, NCBI_EFF_2_2_400_info, NCBI_EFF_2_2_1000_info,
+                  NCBI_EFF_2_3_0_info, NCBI_EFF_2_3_400_info, NCBI_EFF_2_3_1000_info, NCBI_EFF_3_1_0_info, NCBI_EFF_3_1_400_info, NCBI_EFF_3_1_1000_info)
+test_names <- data.frame(c("NCBI_INF_1_1_0", "NCBI_INF_1_1_400", "NCBI_INF_1_1_1000", "NCBI_INF_2_1_0", "NCBI_INF_2_1_400", "NCBI_INF_2_1_1000", "NCBI_INF_2_2_0", 
+                "NCBI_INF_2_2_400", "NCBI_INF_2_2_1000", "NCBI_INF_2_3_0", "NCBI_INF_2_3_400", "NCBI_INF_2_3_1000", "NCBI_INF_3_1_0", "NCBI_INF_3_1_400", 
+                "NCBI_INF_3_1_1000", "NCBI_EFF_1_1_0", "NCBI_EFF_1_1_400", "NCBI_EFF_1_1_1000", "NCBI_EFF_2_1_0", "NCBI_EFF_2_1_400", "NCBI_EFF_2_1_1000", 
+                "NCBI_EFF_2_2_0", "NCBI_EFF_2_2_400", "NCBI_EFF_2_2_1000", "NCBI_EFF_2_3_0", "NCBI_EFF_2_3_400", "NCBI_EFF_2_3_1000", "NCBI_EFF_3_1_0", 
+                "NCBI_EFF_3_1_400", "NCBI_EFF_3_1_1000"))
+NCBI_minbp_model <- (rep(min_bp, 10))
+c = 1
+for (i in NCBI_test) {
+  i <- logreg_test(df_models[[c]], i)
+  if (c == 1) {
+    NCBI_results <- logreg_assess(i, test_names[c,1])
+  }
+  else {
+    NCBI_results <- rbind.data.frame(NCBI_results, logreg_assess(i, test_names[c,1]))
+  }
+  
+  assign(test_names[c,1], i)
+  c = c + 1
+}
+
+for (i in 1:nrow(test_names)) {
+  a <- classify_targets(NCBI_test[[i]], NCBI_info[[i]], NCBI_minbp_model[i])
+  
+  assign(test_names[i,], a)
+}
+
+VirSorter_test <- list(VirSorter_INF_1_1_0, VirSorter_INF_1_1_400, VirSorter_INF_1_1_1000, VirSorter_INF_2_1_0, VirSorter_INF_2_1_400, VirSorter_INF_2_1_1000, 
+                       VirSorter_INF_2_2_0, VirSorter_INF_2_2_400, VirSorter_INF_2_2_1000, VirSorter_INF_2_3_0, VirSorter_INF_2_3_400, VirSorter_INF_2_3_1000, 
+                       VirSorter_INF_3_1_0, VirSorter_INF_3_1_400, VirSorter_INF_3_1_1000, VirSorter_EFF_1_1_0, VirSorter_EFF_1_1_400, VirSorter_EFF_1_1_1000, 
+                       VirSorter_EFF_2_1_0, VirSorter_EFF_2_1_400, VirSorter_EFF_2_1_1000, VirSorter_EFF_2_2_0, VirSorter_EFF_2_2_400, VirSorter_EFF_2_2_1000,
+                       VirSorter_EFF_2_3_0, VirSorter_EFF_2_3_400, VirSorter_EFF_2_3_1000, VirSorter_EFF_3_1_0, VirSorter_EFF_3_1_400, VirSorter_EFF_3_1_1000)
+VirSorter_info <- list(VirSorter_INF_1_1_0_info, VirSorter_INF_1_1_400_info, VirSorter_INF_1_1_1000_info, VirSorter_INF_2_1_0_info, VirSorter_INF_2_1_400_info, 
+                       VirSorter_INF_2_1_1000_info, VirSorter_INF_2_2_0_info, VirSorter_INF_2_2_400_info, VirSorter_INF_2_2_1000_info, VirSorter_INF_2_3_0_info, 
+                       VirSorter_INF_2_3_400_info, VirSorter_INF_2_3_1000_info, VirSorter_INF_3_1_0_info, VirSorter_INF_3_1_400_info, VirSorter_INF_3_1_1000_info, 
+                       VirSorter_EFF_1_1_0_info, VirSorter_EFF_1_1_400_info, VirSorter_EFF_1_1_1000_info, VirSorter_EFF_2_1_0_info, VirSorter_EFF_2_1_400_info, 
+                       VirSorter_EFF_2_1_1000_info, VirSorter_EFF_2_2_0_info, VirSorter_EFF_2_2_400_info, VirSorter_EFF_2_2_1000_info, VirSorter_EFF_2_3_0_info, 
+                       VirSorter_EFF_2_3_400_info, VirSorter_EFF_2_3_1000_info, VirSorter_EFF_3_1_0_info, VirSorter_EFF_3_1_400_info, VirSorter_EFF_3_1_1000_info)
+test_names <- data.frame(c("VirSorter_INF_1_1_0", "VirSorter_INF_1_1_400", "VirSorter_INF_1_1_1000", "VirSorter_INF_2_1_0", "VirSorter_INF_2_1_400", "VirSorter_INF_2_1_1000", 
+                "VirSorter_INF_2_2_0", "VirSorter_INF_2_2_400", "VirSorter_INF_2_2_1000", "VirSorter_INF_2_3_0", "VirSorter_INF_2_3_400", "VirSorter_INF_2_3_1000", 
+                "VirSorter_INF_3_1_0", "VirSorter_INF_3_1_400", "VirSorter_INF_3_1_1000", "VirSorter_EFF_1_1_0", "VirSorter_EFF_1_1_400", "VirSorter_EFF_1_1_1000", 
+                "VirSorter_EFF_2_1_0", "VirSorter_EFF_2_1_400", "VirSorter_EFF_2_1_1000", "VirSorter_EFF_2_2_0", "VirSorter_EFF_2_2_400", "VirSorter_EFF_2_2_1000", 
+                "VirSorter_EFF_2_3_0", "VirSorter_EFF_2_3_400", "VirSorter_EFF_2_3_1000", "VirSorter_EFF_3_1_0", "VirSorter_EFF_3_1_400", "VirSorter_EFF_3_1_1000"))
+VirSorter_minbp_model <- rep(min_bp, 10)
+
+c = 1
+for (i in VirSorter_test) {
+  i <- logreg_test(df_models[[c]], i)
+  if (c == 1) {
+    VirSorter_results <- logreg_assess(i, test_names[c,1])
+  }
+  else {
+    VirSorter_results <- rbind.data.frame(VirSorter_results, logreg_assess(i, test_names[c,1]))
+  }
+  
+  assign(test_names[c,1], i)
+  c = c + 1
+}
+
+for (i in 1:nrow(test_names)) {
+  a <- classify_targets(VirSorter_test[[i]], VirSorter_info[[i]], VirSorter_minbp_model[i])
+  
+  assign(test_names[i,], a)
+}
+```
+
+Does the cutpoint stop at different predicted probabilities?
+```{r}
+colnames(NCBI_results) <- c("sample", "AUC", "E_rel")
+NCBI_results$fit <- 0
+NCBI_results$se.fit <- 0
+NCBI_results$residual.scale <- 0
+NCBI_results$UL <- 0
+NCBI_results$LL <- 0
+NCBI_results$PredictedProb <- 0
+
+for (i in 1:nrow(NCBI_results)) {
+  NCBI_results[i,4:6] <- predict(df_models[[i]], newdata = NCBI_results[i,], type = "link", se = TRUE)
+  NCBI_results[i,] <- within(NCBI_results[i,], {
+    PredictedProb <- plogis(fit)
+    LL <- plogis(fit - (1.96 * se.fit))
+    UL <- plogis(fit + (1.96 * se.fit))
+  })
+}
+
+colnames(VirSorter_results) <- c("sample", "AUC", "E_rel")
+VirSorter_results$fit <- 0
+VirSorter_results$se.fit <- 0
+VirSorter_results$residual.scale <- 0
+VirSorter_results$UL <- 0
+VirSorter_results$LL <- 0
+VirSorter_results$PredictedProb <- 0
+
+for (i in 1:nrow(VirSorter_results)) {
+  VirSorter_results[i,4:6] <- predict(df_models[[i]], newdata = VirSorter_results[i,], type = "link", se = TRUE)
+  VirSorter_results[i,] <- within(VirSorter_results[i,], {
+    PredictedProb <- plogis(fit)
+    LL <- plogis(fit - (1.96 * se.fit))
+    UL <- plogis(fit + (1.96 * se.fit))
+  })
+}
+```
+
+
+Visualize the results
+```{r}
+NCBI_results$matrix <- c(rep("Influent", 15), rep("Effluent", 15))
+NCBI_results$replicate <- c(rep(1, 3), rep(2, 9), rep(3, 3), rep(1, 3), rep(2, 9), rep(3, 3))
+NCBI_results$min_bp <- c(rep(min_bp, 10))
+NCBI_results_prob <- cbind.data.frame(c(rep(1, 15), rep(2, 15)), NCBI_results$replicate, NCBI_results$min_bp, NCBI_results$PredictedProb)
+colnames(NCBI_results_prob) <- c("matrix", "replicate", "min_bp", "PredictedProb")
+
+ReplicateAverages_prob <- NCBI_results_prob %>% group_by(matrix, replicate, min_bp) %>% summarise_each(list(mean))
+ReplicateAverages_prob$matrix <- c(rep("Influent", 9), rep("Effluent", 9))
+
+pretty_plot <- theme_classic() + theme(
+  text = element_text(family = "Lucinda Sans", color = "black"),
+  plot.margin = margin(1,1,1,1, "cm"),
+  axis.line.x.bottom = element_line(color = "black", size = 0.5),
+  axis.line.y.left = element_line(color = "black", size = 0.5),
+  panel.border = element_rect(colour="black", fill = NA, size = 0.5),
+  strip.background = element_blank(),
+  strip.text = element_text(size = 12),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  plot.title = element_text(size = 15),
+  axis.title = element_text(size = 12), 
+  axis.text.y = element_text(size = 12, color = "#000000"),
+  axis.text.x = element_text(size = 12, color = "#000000"))
+
+ggplot(NCBI_results, aes(x=factor(min_bp), y=PredictedProb, color=factor(replicate), group=matrix)) + pretty_plot + geom_beeswarm(cex=3) + 
+  scale_colour_brewer(palette = "Dark2") + geom_beeswarm(data=ReplicateAverages_prob, size=6, shape = 3) + facet_grid(.~matrix) +
+  theme(legend.position = "none") + labs(x = "Minimum Number of Basepairs Mapped to Target", y = "Predicted Probability of Cutpoint")
+
+```
+
+```{r}
+NCBI_genes_all_0 <- rbind.data.frame(NCBI_genes_INF_1_1_0, NCBI_genes_INF_2_1_0, NCBI_genes_INF_2_2_0, NCBI_genes_INF_2_3_0, NCBI_genes_INF_3_1_0, 
+                               NCBI_genes_EFF_1_1_0, NCBI_genes_EFF_2_1_0, NCBI_genes_EFF_2_2_0, NCBI_genes_EFF_2_3_0, NCBI_genes_EFF_3_1_0)
+NCBI_genes_all_0 <- cbind.data.frame(NCBI_genes_all_0$ID, NCBI_genes_all_0$E_rel, NCBI_genes_all_0$gene_copies, NCBI_genes_all_0$fail_cat, NCBI_genes_all_0$LOD)
+colnames(NCBI_genes_all_0) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD")
+
+NCBI_genes_all_0 <- logreg_test(all_0.lr, NCBI_genes_all_0)
+NCBI_all_results <- logreg_assess(NCBI_genes_all_0, "NCBI_genes_all_0")
+
+NCBI_genes_all_400 <- rbind.data.frame(NCBI_genes_INF_1_1_400, NCBI_genes_INF_2_1_400, NCBI_genes_INF_2_2_400, NCBI_genes_INF_2_3_400, 
+                                 NCBI_genes_INF_3_1_400, NCBI_genes_EFF_1_1_400, NCBI_genes_EFF_2_1_400, NCBI_genes_EFF_2_2_400, 
+                                 NCBI_genes_EFF_2_3_400, NCBI_genes_EFF_3_1_400)
+NCBI_genes_all_400 <- cbind.data.frame(NCBI_genes_all_400$ID, NCBI_genes_all_400$E_rel, NCBI_genes_all_400$gene_copies, NCBI_genes_all_400$fail_cat, NCBI_genes_all_400$LOD)
+colnames(NCBI_genes_all_400) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD")
+
+NCBI_genes_all_400 <- logreg_test(all_400.lr, NCBI_genes_all_400)
+NCBI_all_results <- rbind.data.frame(NCBI_all_results, logreg_assess(NCBI_genes_all_400, "NCBI_genes_all_400"))
+
+NCBI_genes_all_1000 <- rbind.data.frame(NCBI_genes_INF_1_1_1000, NCBI_genes_INF_2_1_1000, NCBI_genes_INF_2_2_1000, NCBI_genes_INF_2_3_1000, 
+                                  NCBI_genes_INF_3_1_1000, NCBI_genes_EFF_1_1_1000, NCBI_genes_EFF_2_1_1000, NCBI_genes_EFF_2_2_1000, 
+                                  NCBI_genes_EFF_2_3_1000, NCBI_genes_EFF_3_1_1000)
+NCBI_genes_all_1000 <- cbind.data.frame(NCBI_genes_all_1000$ID, NCBI_genes_all_1000$E_rel, NCBI_genes_all_1000$gene_copies, NCBI_genes_all_1000$fail_cat, NCBI_genes_all_1000$LOD)
+colnames(NCBI_genes_all_1000) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD")
+
+NCBI_genes_all_1000 <- logreg_test(all_1000.lr, NCBI_genes_all_1000)
+NCBI_all_results <- rbind.data.frame(NCBI_all_results, logreg_assess(NCBI_genes_all_1000, "NCBI_genes_all_1000"))
+
+
+NCBI_all_0 <- rbind.data.frame(NCBI_INF_1_1_0, NCBI_INF_2_1_0, NCBI_INF_2_2_0, NCBI_INF_2_3_0, NCBI_INF_3_1_0, 
+                               NCBI_EFF_1_1_0, NCBI_EFF_2_1_0, NCBI_EFF_2_2_0, NCBI_EFF_2_3_0, NCBI_EFF_3_1_0)
+NCBI_all_0 <- cbind.data.frame(NCBI_all_0$ID, NCBI_all_0$E_rel, NCBI_all_0$gene_copies, NCBI_all_0$fail_cat, NCBI_all_0$LOD)
+colnames(NCBI_all_0) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD")
+
+NCBI_all_0 <- logreg_test(all_0.lr, NCBI_all_0)
+NCBI_all_results <- rbind.data.frame(NCBI_all_results, logreg_assess(NCBI_all_0, "NCBI_all_0"))
+
+NCBI_all_400 <- rbind.data.frame(NCBI_INF_1_1_400, NCBI_INF_2_1_400, NCBI_INF_2_2_400, NCBI_INF_2_3_400, 
+                                 NCBI_INF_3_1_400, NCBI_EFF_1_1_400, NCBI_EFF_2_1_400, NCBI_EFF_2_2_400, 
+                                 NCBI_EFF_2_3_400, NCBI_EFF_3_1_400)
+NCBI_all_400 <- cbind.data.frame(NCBI_all_400$ID, NCBI_all_400$E_rel, NCBI_all_400$gene_copies, NCBI_all_400$fail_cat, NCBI_all_400$LOD)
+colnames(NCBI_all_400) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD")
+
+NCBI_all_400 <- logreg_test(all_400.lr, NCBI_all_400)
+NCBI_all_results <- rbind.data.frame(NCBI_all_results, logreg_assess(NCBI_all_400, "NCBI_all_400"))
+
+NCBI_all_1000 <- rbind.data.frame(NCBI_INF_1_1_1000, NCBI_INF_2_1_1000, NCBI_INF_2_2_1000, NCBI_INF_2_3_1000, 
+                                  NCBI_INF_3_1_1000, NCBI_EFF_1_1_1000, NCBI_EFF_2_1_1000, NCBI_EFF_2_2_1000, 
+                                  NCBI_EFF_2_3_1000, NCBI_EFF_3_1_1000)
+NCBI_all_1000 <- cbind.data.frame(NCBI_all_1000$ID, NCBI_all_1000$E_rel, NCBI_all_1000$gene_copies, NCBI_all_1000$fail_cat, NCBI_all_1000$LOD)
+colnames(NCBI_all_1000) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD")
+
+NCBI_all_1000 <- logreg_test(all_1000.lr, NCBI_all_1000)
+NCBI_all_results <- rbind.data.frame(NCBI_all_results, logreg_assess(NCBI_all_1000, "NCBI_all_1000"))
+
+
+VirSorter_all_0 <- rbind.data.frame(VirSorter_INF_1_1_0, VirSorter_INF_2_1_0, VirSorter_INF_2_2_0, VirSorter_INF_2_3_0, 
+                                    VirSorter_INF_3_1_0, VirSorter_EFF_1_1_0, VirSorter_EFF_2_1_0, VirSorter_EFF_2_2_0, 
+                                    VirSorter_EFF_2_3_0, VirSorter_EFF_3_1_0)
+VirSorter_all_0 <- cbind.data.frame(VirSorter_all_0$ID, VirSorter_all_0$E_rel, VirSorter_all_0$gene_copies, VirSorter_all_0$fail_cat, VirSorter_all_0$LOD)
+colnames(VirSorter_all_0) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD")
+
+VirSorter_all_0 <- logreg_test(all_0.lr, VirSorter_all_0)
+NCBI_all_results <- rbind.data.frame(NCBI_all_results, logreg_assess(VirSorter_all_0, "VirSorter_all_0"))
+
+VirSorter_all_400 <- rbind.data.frame(VirSorter_INF_1_1_400, VirSorter_INF_2_1_400, VirSorter_INF_2_2_400, 
+                                      VirSorter_INF_2_3_400, VirSorter_INF_3_1_400, VirSorter_EFF_1_1_400, 
+                                      VirSorter_EFF_2_1_400, VirSorter_EFF_2_2_400, VirSorter_EFF_2_3_400, 
+                                      VirSorter_EFF_3_1_400)
+VirSorter_all_400 <- cbind.data.frame(VirSorter_all_400$ID, VirSorter_all_400$E_rel, VirSorter_all_400$gene_copies, VirSorter_all_400$fail_cat, VirSorter_all_400$LOD)
+colnames(VirSorter_all_400) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD")
+
+VirSorter_all_400 <- logreg_test(all_400.lr, VirSorter_all_400)
+NCBI_all_results <- rbind.data.frame(NCBI_all_results, logreg_assess(VirSorter_all_400, "VirSorter_all_400"))
+
+VirSorter_all_1000 <- rbind.data.frame(VirSorter_INF_1_1_1000, VirSorter_INF_2_1_1000, VirSorter_INF_2_2_1000, 
+                                       VirSorter_INF_2_3_1000, VirSorter_INF_3_1_1000, VirSorter_EFF_1_1_1000, 
+                                       VirSorter_EFF_2_1_1000, VirSorter_EFF_2_2_1000, VirSorter_EFF_2_3_1000, 
+                                       VirSorter_EFF_3_1_1000)
+VirSorter_all_1000 <- cbind.data.frame(VirSorter_all_1000$ID, VirSorter_all_1000$E_rel, VirSorter_all_1000$gene_copies, VirSorter_all_1000$fail_cat, 
+                                       VirSorter_all_1000$LOD)
+colnames(VirSorter_all_1000) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD")
+
+VirSorter_all_1000 <- logreg_test(all_1000.lr, VirSorter_all_1000)
+NCBI_all_results <- rbind.data.frame(NCBI_all_results, logreg_assess(VirSorter_all_1000, "VirSorter_all_1000"))
+
+all_0 <- rbind.data.frame(NCBI_genes_all_0, NCBI_all_0, VirSorter_all_0)
+all_0 <- cbind.data.frame(all_0$ID, all_0$E_rel, all_0$gene_copies, all_0$fail_cat, all_0$LOD)
+colnames(all_0) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD")
+
+all_0 <- logreg_test(all_0.lr, all_0)
+NCBI_all_results <- rbind.data.frame(NCBI_all_results, logreg_assess(all_0, "all_0"))
+
+all_400 <- rbind.data.frame(NCBI_genes_all_400, NCBI_all_400, VirSorter_all_400)
+all_400 <- cbind.data.frame(all_400$ID, all_400$E_rel, all_400$gene_copies, all_400$fail_cat, all_400$LOD)
+colnames(all_400) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD")
+
+all_400 <- logreg_test(all_400.lr, all_400)
+NCBI_all_results <- rbind.data.frame(NCBI_all_results, logreg_assess(all_400, "all_400"))
+
+all_1000 <- rbind.data.frame(NCBI_genes_all_1000, NCBI_all_1000, VirSorter_all_1000)
+all_1000 <- cbind.data.frame(all_1000$ID, all_1000$E_rel, all_1000$gene_copies, all_1000$fail_cat, all_1000$LOD)
+colnames(all_1000) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD")
+
+all_1000 <- logreg_test(all_1000.lr, all_1000)
+NCBI_all_results <- rbind.data.frame(NCBI_all_results, logreg_assess(all_1000, "all_1000"))
+
+colnames(NCBI_all_results) <- c("sample", "AUC", "E_rel")
+NCBI_all_results$fit <- 0
+NCBI_all_results$se.fit <- 0
+NCBI_all_results$residual.scale <- 0
+NCBI_all_results$UL <- 0
+NCBI_all_results$LL <- 0
+NCBI_all_results$PredictedProb <- 0
+
+for (i in 1:nrow(NCBI_all_results)) {
+  NCBI_all_results[i,4:6] <- predict(df_models[[i]], newdata = NCBI_all_results[i,], type = "link", se = TRUE)
+  NCBI_all_results[i,] <- within(NCBI_all_results[i,], {
+    PredictedProb <- plogis(fit)
+    LL <- plogis(fit - (1.96 * se.fit))
+    UL <- plogis(fit + (1.96 * se.fit))
+  })
+}
+```
+
+```{r}
+all_0$min_bp <- 0
+all_400$min_bp <- 400
+all_1000$min_bp <- 1000
+all <- rbind.data.frame(all_0, all_400, all_1000)
+all %>% 
+  ggplot(aes(x=E_rel, y=PredictedProb, col=above_LOD, group=min_bp)) + 
+  facet_grid(.~min_bp) +
+  scale_color_manual(values=c("black", "red")) + 
+  geom_point() + 
+  geom_rug() + 
+  pretty_plot
+```
+
+```{r}
+model_all_0$min_bp <- 0
+model_all_0 <- logreg_test(all_0.lr, model_all_0)
+model_all_400$min_bp <- 400
+model_all_400 <- logreg_test(all_400.lr, model_all_400)
+model_all_1000$min_bp <- 1000
+model_all_1000 <- logreg_test(all_1000.lr, model_all_1000)
+
+model_all <- rbind.data.frame(model_all_0, model_all_400, model_all_1000)
+
+model_all %>% 
+  ggplot(aes(x=E_rel, y=PredictedProb, col=above_LOD, group=min_bp)) + 
+  facet_grid(.~min_bp) +
+  scale_color_manual(values=c("black", "red")) + 
+  geom_point() + 
+  geom_rug() + 
+  pretty_plot
+```
+
+Remake logistic regressions to include E_rel and target length as dependent variables
+```{r}
+model_all_0_v2 <- cbind.data.frame(model_all_0$ID, model_all_0$E_rel, model_all_0$gene_copies, model_all_0$fail_cat, model_all_0$LOD, 
+                                   model_all_0$above_LOD)
+colnames(model_all_0_v2) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD", "above_LOD")
+model_all_0_v2 <- merge.data.frame(model_all_0_v2, STDS_list, by = "ID")
+model_all_0_v2$RG_length <- model_all_0_v2$E_rel * log(model_all_0_v2$length)
+model_all_0_v2$RG_gc <- model_all_0_v2$E_rel * model_all_0_v2$gene_copies
+
+all_0_v2.lr <- glm(LOD ~ E_rel, data = model_all_0_v2, family = binomial(link = "logit"))
+
+NCBI_all_0_v2 <- cbind.data.frame(NCBI_all_0$ID, NCBI_all_0$E_rel, NCBI_all_0$gene_copies, NCBI_all_0$fail_cat, NCBI_all_0$LOD, NCBI_all_0$above_LOD)
+colnames(NCBI_all_0_v2) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD", "above_LOD")
+NCBI_lengths <- as.data.frame(read.table("Map_Indexes/NCBI_viral_length.txt", header = FALSE, sep = "\t"))
+colnames(NCBI_lengths) <- c("ID", "length")
+NCBI_all_0_v2 <- merge.data.frame(NCBI_all_0_v2, NCBI_lengths, by = "ID")
+NCBI_all_0_v2$RG_length <- NCBI_all_0_v2$E_rel * log(NCBI_all_0_v2$length)
+NCBI_all_0_v2$RG_gc <- NCBI_all_0_v2$E_rel * NCBI_all_0_v2$gene_copies
+
+NCBI_all_0_v2 <- logreg_test(all_0_v2.lr, NCBI_all_0_v2)
+
+model_all_0_v2 <- logreg_test(all_0_v2.lr, model_all_0_v2)
+
+model_all_0_v2 %>% 
+  ggplot(aes(x=E_rel, y=PredictedProb, col=above_LOD)) + 
+  scale_color_manual(values=c("black", "red")) + 
+  geom_point() + 
+  geom_rug() + 
+  pretty_plot
+```
+
+```{r}
+model_all_0_v2 <- cbind.data.frame("ID" = model_all_0$ID, "E_rel" = model_all_0$E_rel, "gene_copies" = model_all_0$gene_copies, "fail_cat" = model_all_0$fail_cat, "LOD" = model_all_0$LOD, "above_LOD" = model_all_0$above_LOD, "fit" = model_all_0$fit, "se.fit" = model_all_0$se.fit, "residual.scale" = model_all_0$residual.scale, "UL" = model_all_0$UL, "LL" = model_all_0$LL, "PredictedProb" = model_all_0$PredictedProb)
+model_all_0_v2$database <- "standards"
+NCBI_all_0_v2$database <- "NCBI"
+
+VirSorter_all_0_v2 <- cbind.data.frame(VirSorter_all_0$ID, VirSorter_all_0$E_rel, VirSorter_all_0$gene_copies, VirSorter_all_0$fail_cat, VirSorter_all_0$LOD, VirSorter_all_0$above_LOD)
+colnames(VirSorter_all_0_v2) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD", "above_LOD")
+VirSorter_lengths <- as.data.frame(read.table("Map_Indexes/VirSorter_curated_db_length.txt", header = FALSE, sep = "\t"))
+colnames(VirSorter_lengths) <- c("ID", "length")
+VirSorter_all_0_v2 <- merge.data.frame(VirSorter_all_0_v2, VirSorter_lengths, by = "ID")
+VirSorter_all_0_v2$RG_length <- VirSorter_all_0_v2$E_rel * log(VirSorter_all_0_v2$length)
+VirSorter_all_0_v2$RG_gc <- VirSorter_all_0_v2$E_rel * VirSorter_all_0_v2$gene_copies
+
+VirSorter_all_0_v2 <- logreg_test(all_0_v2.lr, VirSorter_all_0_v2)
+VirSorter_all_0_v2$database <- "VirSorter"
+
+NCBI_genes_all_0$database <- "NCBI_genes"
+NCBI_all_0$database <- "NCBI"
+VirSorter_all_0$database <- "VirSorter"
+full_data_0 <- rbind.data.frame(model_all_0_v2, NCBI_all_0, VirSorter_all_0, NCBI_genes_all_0)
+
+full_data_0 %>%
+  ggplot(aes(x=log(gene_copies), y=E_rel, col=factor(fail_cat), group=factor(database))) +
+  geom_point(shape = 1, size = 1) + pretty_plot + facet_grid(.~database)
+```
+
+```{r}
+model_all_400_v2 <- cbind.data.frame(model_all_400$ID, model_all_400$E_rel, model_all_400$gene_copies, model_all_400$fail_cat, model_all_400$LOD, 
+                                    model_all_400$above_LOD, model_all_400$fit, model_all_400$se.fit, model_all_400$residual.scale,
+                                    model_all_400$UL, model_all_400$LL, model_all_400$PredictedProb)
+model_all_400_v2$database <- "standards"
+colnames(model_all_400_v2) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD", "above_LOD", "fit", "se.fit", "residual.scale", "UL", "LL", "PredictedProb", "database")
+NCBI_all_400$database <- "NCBI"
+VirSorter_all_400$database <- "VirSorter"
+NCBI_genes_all_400$database <- "NCBI_genes"
+full_data_400 <- rbind.data.frame(model_all_400_v2, NCBI_all_400, VirSorter_all_400, NCBI_genes_all_400)
+```
+
+```{r}
+model_all_1000_v2 <- cbind.data.frame(model_all_1000$ID, model_all_1000$E_rel, model_all_1000$gene_copies, model_all_1000$fail_cat, model_all_1000$LOD, 
+                                    model_all_1000$above_LOD, model_all_1000$fit, model_all_1000$se.fit, model_all_1000$residual.scale,
+                                    model_all_1000$UL, model_all_1000$LL, model_all_1000$PredictedProb)
+model_all_1000_v2$database <- "standards"
+colnames(model_all_1000_v2) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD", "above_LOD", "fit", "se.fit", "residual.scale", "UL", "LL", "PredictedProb", "database")
+NCBI_all_1000$database <- "NCBI"
+VirSorter_all_1000$database <- "VirSorter"
+NCBI_genes_all_1000$database <- "NCBI_genes"
+
+full_data_1000 <- rbind.data.frame(model_all_1000_v2, NCBI_all_1000, VirSorter_all_1000, NCBI_genes_all_1000)
+```
+
+```{r}
+model_all_0_v2 <- cbind.data.frame(model_all_0$ID, model_all_0$E_rel, model_all_0$gene_copies, model_all_0$fail_cat, model_all_0$LOD, 
+                                    model_all_0$above_LOD, model_all_0$fit, model_all_0$se.fit, model_all_0$residual.scale,
+                                    model_all_0$UL, model_all_0$LL, model_all_0$PredictedProb)
+model_all_0_v2$database <- "standards"
+colnames(model_all_0_v2) <- c("ID", "E_rel", "gene_copies", "fail_cat", "LOD", "above_LOD", "fit", "se.fit", "residual.scale", "UL", "LL", "PredictedProb", "database")
+NCBI_all_0$database <- "NCBI"
+VirSorter_all_0$database <- "VirSorter"
+NCBI_genes_all_0$database <- "NCBI_genes"
+
+full_data_0 <- rbind.data.frame(model_all_0_v2, NCBI_all_0, VirSorter_all_0, NCBI_genes_all_0)
+```
+
+```{r}
+full_data_0$min_bp <- 0
+full_data_400$min_bp <- 400
+full_data_1000$min_bp <- 1000
+full_data <- rbind.data.frame(full_data_0, full_data_400, full_data_1000)
+full_data$database[full_data$database == 'standards'] <- "Model Dataset: dsDNA \nand ssDNA Standards"
+full_data$database[full_data$database == 'NCBI_genes'] <- "NCBI Viral \nDatabase \nGenes Mapping"
+full_data$database[full_data$database == 'NCBI'] <- "NCBI Viral \nDatabase \nGenomes Mapping"
+full_data$database[full_data$database == 'VirSorter'] <- "VirSorter Curated \nDatabase \nGenomes Mapping"
+full_data$database <- factor(full_data$database, levels=c('Model Dataset: dsDNA \nand ssDNA Standards', 'NCBI Viral \nDatabase \nGenes Mapping', 'NCBI Viral \nDatabase \nGenomes Mapping', 'VirSorter Curated \nDatabase \nGenomes Mapping'))
+full_data$fail_cat[full_data$fail_cat == 'Pass'] <- "Passes LOD"
+full_data$fail_cat[full_data$fail_cat == 'Cov_Fail'] <- "Coverage"
+full_data$fail_cat[full_data$fail_cat == 'Dist_Fail'] <- "Distribution"
+full_data$fail_cat[full_data$fail_cat == 'Cov_Dist_Fail'] <- "Coverage and Distribution"
+full_data$fail_cat[full_data$fail_cat == 'All_Fail'] <- "Coverage, Distribution, \nand Basepair Count"
+full_data$fail_cat[full_data$fail_cat == 'bp_Fail'] <- "Basepair Count"
+full_data$fail_cat[full_data$fail_cat == 'Cov_bp_Fail'] <- "Coverage and Basepair Count"
+full_data$fail_cat[full_data$fail_cat == 'Dist_bp_Fail'] <- "Distribution and Basepair Count"
+```
+
+```{r}
+NCBI_length <- as.data.frame(read.table("Map_Indexes/NCBI_viral_length.txt", sep = "\t", header = FALSE))
+colnames(NCBI_length) <- c("ID", "length")
+NCBI_genes_length <- as.data.frame(read.table("Map_Indexes/NCBI_viral_genes_length.txt", sep = "\t", header = FALSE))
+colnames(NCBI_genes_length) <- c("ID", "length")
+VirSorter_length <- as.data.frame(read.table("Map_Indexes/VirSorter_curated_db_length.txt", sep = "\t", header = FALSE))
+colnames(VirSorter_length) <- c("ID", "length")
+
+all_length <- rbind.data.frame(NCBI_length, NCBI_genes_length, VirSorter_length)
+
+all_length <- rbind.data.frame(STDS_list, F_STDS_list, all_length)
+nrow(data.frame(unique(all_length$ID)))
+full_data <- merge(full_data, all_length, by = "ID")
+
+fail_reason <- subset(full_data, !(fail_cat == "Passes_LOD")) %>% 
+  ggplot(aes(x=length, y=fail_cat, col=factor(database), group=factor(min_bp))) + 
+  scale_color_brewer(palette = "Dark2") + 
+  geom_point(shape = 1) + 
+  xlab("Target Sequence Length (bp)") + ylab("Reason for Failing \nDectection Threshold") +
+  pretty_plot + facet_grid(.~min_bp) + theme(panel.spacing = unit(1.5, "lines")) +
+  guides(colour = guide_legend(override.aes = list(size=1, shape=1), title = "Database")) + 
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  theme(legend.position = "bottom")
+
+fail_reason
+```
+
+```{r}
+cairo_pdf("figures/Figure_S2.pdf", width = 15, height = 7)
+fail_reason
+dev.off()
+```
+
+Determine min E_rel for LOD -- set the minimum at P(above LOD = 0.5)
+```{r}
+results <- logreg_assess(all_0, "all_0")
+
+
+findInt <- function(model, value) {
+    function(x) {
+        predict(model, data.frame(E_rel=x), type="response") - value
+     }
+}
+
+E_detect <- uniroot(findInt(all_0.lr, .5), range(all_0$E_rel))$root
+
+```
+
+```{r}
+NCBI_length <- as.data.frame(read.table("Map_Indexes/NCBI_viral_length.txt", sep = "\t", header = FALSE))
+colnames(NCBI_length) <- c("ID", "length")
+NCBI_genes_length <- as.data.frame(read.table("Map_Indexes/NCBI_viral_genes_length.txt", sep = "\t", header = FALSE))
+colnames(NCBI_genes_length) <- c("ID", "length")
+VirSorter_length <- as.data.frame(read.table("Map_Indexes/VirSorter_curated_db_length.txt", sep = "\t", header = FALSE))
+colnames(VirSorter_length) <- c("ID", "length")
+
+all_length <- rbind.data.frame(NCBI_length, NCBI_genes_length, VirSorter_length)
+
+all_0_v2 <- merge(all_0, all_length, by = "ID")
+
+# bin by length
+min_length <- min(all_0_v2$length)
+max_length <- max(all_0_v2$length)
+median_length <- median(all_0_v2$length)
+all_0_v2 <- arrange(all_0_v2, length)
+length_bins <- data.frame(c(500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 12500, 15000, 17500, 20000, 22500, 25000, 27500, 30000, 35000, 40000, 50000, 60000, 75000, 100000, 200000))
+for (i in 1:(nrow(length_bins)+1)) {
+  if (i == 1) {
+    bin <- subset(all_0_v2, length <= length_bins[i,1])
+    name <- "<=len_bin"
+    name <- gsub("len_bin", length_bins[i,1], name)
+    results_lengths <- c(logreg_assess(bin, name), "num_in_bin" = nrow(bin))
+  } else if (i == (nrow(length_bins)+1)) {
+    bin <- subset(all_0_v2, length > length_bins[i-1,1])
+    name <- ">len_bin"
+    name <- gsub("len_bin", length_bins[i-1,1], name)
+    results_lengths <- rbind.data.frame(results_lengths, c(logreg_assess(bin, name), "num_in_bin" = nrow(bin)))
+  }
+  else {
+    bin <- subset(all_0_v2, length <= length_bins[i,1] & length > length_bins[i-1,1])
+    name <- "sbin-lbin"
+    name <- gsub("sbin", length_bins[i-1,1], name)
+    name <- gsub("lbin", length_bins[i,1], name)
+    results_lengths <- rbind.data.frame(results_lengths, c(logreg_assess(bin, name), "num_in_bin" = nrow(bin)))
+  }
+}
+
+colnames(results_lengths) <- c("sample", "AUC", "E_rel", "num_in_bin")
+results_lengths$fit <- 0
+results_lengths$se.fit <- 0
+results_lengths$residual.scale <- 0
+results_lengths$UL <- 0
+results_lengths$LL <- 0
+results_lengths$PredictedProb <- 0
+
+for (i in 1:nrow(results_lengths)) {
+  results_lengths[i,5:7] <- predict(all_0.lr, newdata = results_lengths[i,], type = "link", se = TRUE)
+  results_lengths[i,] <- within(results_lengths[i,], {
+    PredictedProb <- plogis(fit)
+    LL <- plogis(fit - (1.96 * se.fit))
+    UL <- plogis(fit + (1.96 * se.fit))
+  })
+}
+
+results_lengths$median_length <- c(250, 750, 1500, 2500, 3500, 4500, 5500, 6500, 7500, 8500, 9500, 11250, 13750, 16250, 18750, 21250, 23750, 26250, 28750, 32500, 37500, 45000, 55000, 67500, 87500, 150000, median(subset(all_0_v2, length > 200000)$length))
+colnames(results_lengths) <- c("length bin", "AUC", "optimal cutpoint", "num_in_bin", "fit", "se.fit", "residual.scale", "UL", "LL", "PredictedProb", "median length")
+
+my.formula <- y ~ log10(x)
+
+detect <- results_lengths %>% 
+  ggplot(aes(x=`median length`, y=`optimal cutpoint`, color=PredictedProb)) + 
+  geom_smooth(method = "lm", se = FALSE, color = "black", formula = my.formula) +
+  stat_poly_eq(formula = my.formula, aes(label = paste(..eq.label.., ..rr.label.., sep = "~~"), size = 12), parse = TRUE) +
+  geom_point() + 
+  pretty_plot + 
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  xlab("Reference Target Length (bp)") + ylab(expression(paste("Optimal ", E[detect]))) + 
+  scale_color_continuous(name="Logistic \nRegression \nProbability")
+
+detect
+```
+
+Updated bins (remove any target lengths less than 900 bp)
+```{r}
+length_bins <- data.frame(c(900, 1500, 2000, 3000, 5000, 10000, 12500, 15000, 17500, 20000, 22500, 25000, 27500, 30000, 35000, 40000, 45000, 50000, 60000, 75000, 100000, 200000))
+for (i in 2:(nrow(length_bins)+1)) {
+  if (i == 2) {
+    bin <- subset(all_0_v2, length <= length_bins[i,1] & length > length_bins[i-1,1])
+    name <- "sbin-lbin"
+    name <- gsub("sbin", length_bins[i-1,1], name)
+    name <- gsub("lbin", length_bins[i,1], name)
+    results_lengths <- c(logreg_assess(bin, name), "num_in_bin" = nrow(bin), "mean_E_rel" = mean(bin$E_rel), "sd_E_rel" = sd(bin$E_rel))
+  } else if (i == (nrow(length_bins)+1)) {
+    bin <- subset(all_0_v2, length > length_bins[i-1,1] & length <= 250000)
+    name <- ">len_bin"
+    name <- gsub("len_bin", length_bins[i-1,1], name)
+    results_lengths <- rbind.data.frame(results_lengths, c(logreg_assess(bin, name), "num_in_bin" = nrow(bin), "mean_E_rel" = mean(bin$E_rel), "sd_E_rel" = sd(bin$E_rel)))
+  }
+  else {
+    bin <- subset(all_0_v2, length <= length_bins[i,1] & length > length_bins[i-1,1])
+    name <- "sbin-lbin"
+    name <- gsub("sbin", length_bins[i-1,1], name)
+    name <- gsub("lbin", length_bins[i,1], name)
+    results_lengths <- rbind.data.frame(results_lengths, c(logreg_assess(bin, name), "num_in_bin" = nrow(bin), "mean_E_rel" = mean(bin$E_rel), "sd_E_rel" = sd(bin$E_rel)))
+  }
+}
+
+colnames(results_lengths) <- c("sample", "AUC", "E_rel", "num_in_bin", "mean_E_rel", "sd_E_rel")
+results_lengths$fit <- 0
+results_lengths$se.fit <- 0
+results_lengths$residual.scale <- 0
+results_lengths$UL <- 0
+results_lengths$LL <- 0
+results_lengths$PredictedProb <- 0
+
+for (i in 1:nrow(results_lengths)) {
+  results_lengths[i,7:9] <- predict(all_0.lr, newdata = results_lengths[i,], type = "link", se = TRUE)
+  results_lengths[i,] <- within(results_lengths[i,], {
+    PredictedProb <- plogis(fit)
+    LL <- plogis(fit - (1.96 * se.fit))
+    UL <- plogis(fit + (1.96 * se.fit))
+  })
+}
+
+results_lengths$median_length <- c(1200, 1750, 2500, 4000, 7500, 11250, 13750, 16250, 18750, 21250, 23750, 26250, 28750, 32500, 37500, 42500, 47500, 55000, 67500, 87500, 150000, median(subset(all_0_v2, length > 200000)$length))
+colnames(results_lengths) <- c("length bin", "AUC", "optimal cutpoint", "num_in_bin", "mean_E_rel", "sd_E_rel", "fit", "se.fit", "residual.scale", "UL", "LL", "PredictedProb", "median length")
+
+my.formula <- y ~ x
+
+detect <- results_lengths %>% 
+  ggplot(aes(x=`median length`, y=`optimal cutpoint`, color=PredictedProb)) + 
+  geom_smooth(method = "lm", se = FALSE, color = "black", formula = my.formula) +
+  stat_poly_eq(formula = my.formula, aes(label = paste(..eq.label.., ..rr.label.., sep = "~~"), size = 12), parse = TRUE) +
+  geom_point() + 
+  pretty_plot + 
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  xlab("Reference Target Length (bp)") + ylab(expression(paste("Optimal ", E[detect]))) + 
+  scale_color_continuous(name="Logistic \nRegression \nProbability")
+
+detect
+
+ggplot(results_lengths, aes(x = `median length`, y = mean_E_rel, color = log10(num_in_bin))) + 
+  geom_pointrange(aes(ymin = mean_E_rel - sd_E_rel, ymax = mean_E_rel + sd_E_rel), shape = 1, size = 0.2) +
+  pretty_plot + 
+  labs(x = "Reference Target Length (bp)", y = "Mean Relative Entropy", color = "Number of\nTargets") +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) #+
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+```
+
+```{r}
+cairo_pdf("figures/Figure_S3.pdf", width = 7, height = 5)
+detect
+dev.off()
+```
+
+```{r}
+colnames(results_lengths) <- c("length bin", "AUC", "target_cutpoint", "num_in_bin", "mean_E_rel", "sd_E_rel", "fit", "se.fit", "residual.scale", "UL", "LL", "PredictedProb", "length")
+
+my.formula <- target_cutpoint ~ log10(length)
+
+E_detect <- lm(my.formula, results_lengths)
+
+saveRDS(E_detect, file = "Regressions/Langenfeld_2024_E_detect")
+```
+
+
+Updated bins based on properly QC'd reads
+```{r}
+length_bins <- data.frame(c(200, 250, 300, 350, 400, 450, 500, 600, 700, 800, 900, 1500, 2000, 3000, 5000, 10000, 12500, 15000, 17500, 20000, 22500, 25000, 27500, 30000, 35000, 40000, 45000, 50000, 60000, 75000, 100000, 200000))
+
+### remove targets less than 100 bp long (too short of target and all pass LOD) and remove targets greater than 300,000 bp long (too great a spread in lengths for the num of targets and all fail LOD)
+for (i in 1:(nrow(length_bins)+1)) {
+  if (i == 1) {
+    bin <- subset(all_0_v2, length <= length_bins[i,1] & length >= 100)
+    name <- "<=len_bin"
+    name <- gsub("len_bin", length_bins[i,1], name)
+    results_lengths <- c(logreg_assess(bin, name), "num_in_bin" = nrow(bin))
+  } else if (i == (nrow(length_bins)+1)) {
+    bin <- subset(all_0_v2, length > length_bins[i-1,1] & length <= 250000)
+    name <- "len_bin - 250000"
+    name <- gsub("len_bin", length_bins[i-1,1], name)
+    results_lengths <- rbind.data.frame(results_lengths, c(logreg_assess(bin, name), "num_in_bin" = nrow(bin)))
+  }
+  else {
+    bin <- subset(all_0_v2, length <= length_bins[i,1] & length > length_bins[i-1,1])
+    name <- "sbin-lbin"
+    name <- gsub("sbin", length_bins[i-1,1], name)
+    name <- gsub("lbin", length_bins[i,1], name)
+    results_lengths <- rbind.data.frame(results_lengths, c(logreg_assess(bin, name), "num_in_bin" = nrow(bin)))
+  }
+}
+
+colnames(results_lengths) <- c("sample", "AUC", "E_rel", "num_in_bin")
+results_lengths$fit <- 0
+results_lengths$se.fit <- 0
+results_lengths$residual.scale <- 0
+results_lengths$UL <- 0
+results_lengths$LL <- 0
+results_lengths$PredictedProb <- 0
+
+for (i in 1:nrow(results_lengths)) {
+  results_lengths[i,5:7] <- predict(all_0.lr, newdata = results_lengths[i,], type = "link", se = TRUE)
+  results_lengths[i,] <- within(results_lengths[i,], {
+    PredictedProb <- plogis(fit)
+    LL <- plogis(fit - (1.96 * se.fit))
+    UL <- plogis(fit + (1.96 * se.fit))
+  })
+}
+
+results_lengths$median_length <- c(150, 225, 275, 325, 375, 425, 475, 550, 650, 750, 850, 1200, 1750, 2500, 4000, 7500, 11250, 13750, 16250, 18750, 21250, 23750, 26250, 28750, 32500, 37500, 42500, 47500, 55000, 67500, 87500, 150000, 200000)
+colnames(results_lengths) <- c("length bin", "AUC", "optimal cutpoint", "num_in_bin", "fit", "se.fit", "residual.scale", "UL", "LL", "PredictedProb", "median length")
+
+my.formula <- y ~ x
+temp <- subset(results_lengths, `median length` > 900)
+detect_high <- temp %>% 
+  ggplot(aes(x=`median length`, y=`optimal cutpoint`, color=PredictedProb)) + 
+  geom_smooth(method = "lm", se = FALSE, color = "black", formula = my.formula) +
+  stat_poly_eq(formula = my.formula, aes(label = paste(..eq.label.., ..rr.label.., sep = "~~"), size = 12), parse = TRUE) +
+  geom_point() + 
+  pretty_plot + ylim(0.65, 0.83) + lims(color = c(0,1)) +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  xlab("Reference Target Length (bp)") + ylab(expression(paste("Optimal ", E[detect]))) + 
+  scale_color_continuous(name="Logistic \nRegression \nProbability")
+
+detect_high
+
+my.formula <- y ~ x
+temp2 <- subset(results_lengths, `median length` <= 900)
+detect_low <- temp2 %>% 
+  ggplot(aes(x=`median length`, y=`optimal cutpoint`, color=PredictedProb)) + 
+  geom_smooth(method = "lm", se = FALSE, color = "black", formula = my.formula) +
+  stat_poly_eq(formula = my.formula, aes(label = paste(..eq.label.., ..rr.label.., sep = "~~"), size = 12), parse = TRUE) +
+  geom_point() + 
+  pretty_plot + ylim(0.65, 0.83) + lims(color = c(0,1)) +
+  xlab("Reference Target Length (bp)") + ylab(expression(paste("Optimal ", E[detect]))) + 
+  scale_color_continuous(name="Logistic \nRegression \nProbability")
+
+detect_low
+```
+
+Save the regression for the E_detect
+```{r}
+colnames(temp2) <- c("length bin", "AUC", "target_cutpoint", "num_in_bin", "fit", "se.fit", "residual.scale", "UL", "LL", "PredictedProb", "length")
+
+my.formula <- target_cutpoint ~ length
+
+E_detect_low <- lm(my.formula, temp2)
+
+saveRDS(E_detect_low, file = "Regressions/Langenfeld_2024_E_detect_shorter900bp")
+```
+
+
+### Figure 2 ####################
+Results of reads mapping to known standard sequences (includes downsampling). A = raw results of expected concentration vs. predicted concentration; B = detection threshold applied results of expected concentration vs. predicted concentration; C = quantification correction results of expected concentration vs. predicted concentration. 
+
+
+```{r}
+sample_info <- as.data.frame(read.table(file = "Spike-ins/2021_WW_down_sample_info.txt", sep = '\t', header = TRUE, stringsAsFactors = FALSE))
+
+spike_conc <- as.data.frame(read.table("Spike-ins/2021_WW_stds_ddPCR_conc.txt", header = TRUE, sep = '\t', stringsAsFactors = FALSE))
+
+samples <- data.frame(c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1", "EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1", "INF_1_1_20", "INF_2_1_20", "INF_2_2_20", "INF_2_3_20", "INF_3_1_20", "EFF_1_1_20", "EFF_2_1_20", "EFF_2_2_20", "EFF_2_3_20", "EFF_3_1_20", "INF_1_1_1", "INF_2_1_1", "INF_2_2_1", "INF_2_3_1", "INF_3_1_1", "EFF_1_1_1", "EFF_2_1_1", "EFF_2_2_1", "EFF_2_3_1", "EFF_3_1_1"))
+main_sample <- data.frame(rep(c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1", "EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1"), 3))
+
+std_mapping_list <- c("Mapping/INF_1_1/standards_0/standards_mapping_analysis.txt", "Mapping/INF_2_1/standards_0/standards_mapping_analysis.txt", "Mapping/INF_2_2/standards_0/standards_mapping_analysis.txt", "Mapping/INF_2_3/standards_0/standards_mapping_analysis.txt", "Mapping/INF_3_1/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_1_1/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_2_1/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_2_2/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_2_3/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_3_1/standards_0/standards_mapping_analysis.txt", "Mapping/INF_1_1_20/standards_0/standards_mapping_analysis.txt", "Mapping/INF_2_1_20/standards_0/standards_mapping_analysis.txt", "Mapping/INF_2_2_20/standards_0/standards_mapping_analysis.txt", "Mapping/INF_2_3_20/standards_0/standards_mapping_analysis.txt", "Mapping/INF_3_1_20/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_1_1_20/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_2_1_20/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_2_2_20/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_2_3_20/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_3_1_20/standards_0/standards_mapping_analysis.txt", "Mapping/INF_1_1_1/standards_0/standards_mapping_analysis.txt", "Mapping/INF_2_1_1/standards_0/standards_mapping_analysis.txt", "Mapping/INF_2_2_1/standards_0/standards_mapping_analysis.txt", "Mapping/INF_2_3_1/standards_0/standards_mapping_analysis.txt", "Mapping/INF_3_1_1/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_1_1_1/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_2_1_1/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_2_2_1/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_2_3_1/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_3_1_1/standards_0/standards_mapping_analysis.txt")
+
+prediction <- function (mapping, DNA_input, DNA_conc) {
+  pred_conc_calc <- function(copies, mass, conc) {
+    predicted <- copies*conc/mass
+    # (gene copy standard_x)/(ng DNA library insert) = gene copies standard_x/ng total DNA*(ng DNA/µL DNA extract)
+    return(predicted)
+  }
+  
+  result = data.frame(mapping$ID)
+  result$predicted_conc <- pred_conc_calc(as.numeric(mapping$gene_copies), DNA_input, DNA_conc)
+  colnames(result) <- c("ID", "predicted_conc")
+  
+  return(result)
+}
+
+for (i in 1:nrow(samples)) {
+  mapping <- read.table(std_mapping_list[i], header = TRUE, sep = "\t")
+  temp <- main_sample[i,1]
+  down <- subset(sample_info, Sample == samples[i,1])$downsample
+  ddPCR_temp <- data.frame("ID" = spike_conc$ID, "expected_conc" = as.numeric(spike_conc[,temp]))
+  ddPCR_temp$expected_conc <- ddPCR_temp$expected_conc*down/100
+  mapping <- merge.data.frame(mapping, ddPCR_temp, by = "ID", all.y = TRUE)
+  temp <- prediction(mapping, sample_info$lib_mass, sample_info$DNA_conc)
+  mapping <- merge.data.frame(mapping, temp, by = "ID")
+  mapping$sample <- samples[i,1]
+  mapping$filter <- "NO"
+  mapping$nuc_acid <- "dsDNA"
+  mapping$nuc_acid[mapping$ID %in% c("NC_000936.1_S3", "NC_027637.1_S2", "NC_039057.1_S1", "NC_025708.1_S1", "NC_010429.1_S4")] <- "ssDNA"
+  mapping$downsample <- down
+  
+  if (i == 1) {
+    stds_no_filter <- mapping
+  } 
+  else {
+    stds_no_filter <- rbind.data.frame(stds_no_filter, mapping)
+  }
+}
+
+stds_no_filter$E_rel[is.na(stds_no_filter$E_rel)] <- 0
+stds_no_filter$predicted_conc[is.na(stds_no_filter$predicted_conc)] <- 0
+```
+
+Determine the mean concentration and std deviation of the technical replicates (i.e., INF_2_1, INF_2_2, INF_2_3)
+```{r}
+mapping_INF_2 <- subset(stds_no_filter, sample %in% c("INF_2_1", "INF_2_2", "INF_2_3"))
+temp <- aggregate(mapping_INF_2["expected_conc"], mapping_INF_2["ID"], FUN = function(x) mean(x))
+temp <- merge(aggregate(mapping_INF_2["E_rel"], mapping_INF_2["ID"], FUN = function(x) mean(x)), aggregate(mapping_INF_2["C_o"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_INF_2["R_FVE"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_INF_2["B_G"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_INF_2["gene_copies"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_INF_2["expected_conc"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_INF_2["expected_conc"], mapping_INF_2["ID"], FUN = function(x) sd(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_INF_2["predicted_conc"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_INF_2["predicted_conc"], mapping_INF_2["ID"], FUN = function(x) sd(x)), by = "ID")
+temp$sample <- "INF_2_all"
+temp$filter <- "NO"
+temp_2 <- subset(mapping_INF_2, sample == "INF_2_1")
+temp_2 <- cbind.data.frame("ID" = temp_2$ID, "nuc_acid" = temp_2$nuc_acid)
+temp <- merge(temp, temp_2, by = "ID")
+temp$downsample <- 100
+colnames(temp) <- c("ID", "E_rel", "C_o", "R_FVE", "B_G", "gene_copies", "expected_conc", "sd_exp_conc", "predicted_conc", "sd_pred_conc", "sample", "filter", "nuc_acid", "downsample")
+
+stds_no_filter_2 <- subset(stds_no_filter, !(sample %in% c("INF_2_1", "INF_2_2", "INF_2_3")))
+stds_no_filter_2$sd_exp_conc <- NA
+stds_no_filter_2$sd_pred_conc <- NA
+stds_no_filter_2 <- rbind.data.frame(stds_no_filter_2, temp)
+
+mapping_INF_2 <- subset(stds_no_filter, sample %in% c("INF_2_1_20", "INF_2_2_20", "INF_2_3_20"))
+temp <- aggregate(mapping_INF_2["expected_conc"], mapping_INF_2["ID"], FUN = function(x) mean(x))
+temp <- merge(aggregate(mapping_INF_2["E_rel"], mapping_INF_2["ID"], FUN = function(x) mean(x)), aggregate(mapping_INF_2["C_o"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_INF_2["R_FVE"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_INF_2["B_G"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_INF_2["gene_copies"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_INF_2["expected_conc"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_INF_2["expected_conc"], mapping_INF_2["ID"], FUN = function(x) sd(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_INF_2["predicted_conc"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_INF_2["predicted_conc"], mapping_INF_2["ID"], FUN = function(x) sd(x)), by = "ID")
+temp$sample <- "INF_2_all_20"
+temp$filter <- "NO"
+temp <- merge(temp, temp_2, by = "ID")
+temp$downsample <- 20
+colnames(temp) <- c("ID", "E_rel", "C_o", "R_FVE", "B_G", "gene_copies", "expected_conc", "sd_exp_conc", "predicted_conc", "sd_pred_conc", "sample", "filter", "nuc_acid", "downsample")
+
+stds_no_filter_2 <- subset(stds_no_filter_2, !(sample %in% c("INF_2_1_20", "INF_2_2_20", "INF_2_3_20")))
+stds_no_filter_2 <- rbind.data.frame(stds_no_filter_2, temp)
+
+mapping_INF_2 <- subset(stds_no_filter, sample %in% c("INF_2_1_1", "INF_2_2_1", "INF_2_3_1"))
+temp <- aggregate(mapping_INF_2["expected_conc"], mapping_INF_2["ID"], FUN = function(x) mean(x))
+temp <- merge(aggregate(mapping_INF_2["E_rel"], mapping_INF_2["ID"], FUN = function(x) mean(x)), aggregate(mapping_INF_2["C_o"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_INF_2["R_FVE"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_INF_2["B_G"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_INF_2["gene_copies"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_INF_2["expected_conc"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_INF_2["expected_conc"], mapping_INF_2["ID"], FUN = function(x) sd(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_INF_2["predicted_conc"], mapping_INF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_INF_2["predicted_conc"], mapping_INF_2["ID"], FUN = function(x) sd(x)), by = "ID")
+temp$sample <- "INF_2_all_1"
+temp$filter <- "NO"
+temp <- merge(temp, temp_2, by = "ID")
+temp$downsample <- 1
+colnames(temp) <- c("ID", "E_rel", "C_o", "R_FVE", "B_G", "gene_copies", "expected_conc", "sd_exp_conc", "predicted_conc", "sd_pred_conc", "sample", "filter", "nuc_acid", "downsample")
+
+stds_no_filter_2 <- subset(stds_no_filter_2, !(sample %in% c("INF_2_1_1", "INF_2_2_1", "INF_2_3_1")))
+stds_no_filter_2 <- rbind.data.frame(stds_no_filter_2, temp)
+
+mapping_EFF_2 <- subset(stds_no_filter, sample %in% c("EFF_2_1", "EFF_2_2", "EFF_2_3"))
+temp <- aggregate(mapping_EFF_2["expected_conc"], mapping_EFF_2["ID"], FUN = function(x) mean(x))
+temp <- merge(aggregate(mapping_EFF_2["E_rel"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), aggregate(mapping_EFF_2["C_o"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_EFF_2["R_FVE"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_EFF_2["B_G"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_EFF_2["gene_copies"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_EFF_2["expected_conc"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_EFF_2["expected_conc"], mapping_EFF_2["ID"], FUN = function(x) sd(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_EFF_2["predicted_conc"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_EFF_2["predicted_conc"], mapping_EFF_2["ID"], FUN = function(x) sd(x)), by = "ID")
+temp$sample <- "EFF_2_all"
+temp$filter <- "NO"
+temp_2 <- subset(mapping_EFF_2, sample == "EFF_2_1")
+temp_2 <- cbind.data.frame("ID" = temp_2$ID, "nuc_acid" = temp_2$nuc_acid)
+temp <- merge(temp, temp_2, by = "ID")
+temp$downsample <- 100
+colnames(temp) <- c("ID", "E_rel", "C_o", "R_FVE", "B_G", "gene_copies", "expected_conc", "sd_exp_conc", "predicted_conc", "sd_pred_conc", "sample", "filter", "nuc_acid", "downsample")
+
+stds_no_filter_2 <- subset(stds_no_filter_2, !(sample %in% c("EFF_2_1", "EFF_2_2", "EFF_2_3")))
+stds_no_filter_2 <- rbind.data.frame(stds_no_filter_2, temp)
+
+mapping_EFF_2 <- subset(stds_no_filter, sample %in% c("EFF_2_1_20", "EFF_2_2_20", "EFF_2_3_20"))
+temp <- aggregate(mapping_EFF_2["expected_conc"], mapping_EFF_2["ID"], FUN = function(x) mean(x))
+temp <- merge(aggregate(mapping_EFF_2["E_rel"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), aggregate(mapping_EFF_2["C_o"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_EFF_2["R_FVE"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_EFF_2["B_G"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_EFF_2["gene_copies"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_EFF_2["expected_conc"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_EFF_2["expected_conc"], mapping_EFF_2["ID"], FUN = function(x) sd(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_EFF_2["predicted_conc"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_EFF_2["predicted_conc"], mapping_EFF_2["ID"], FUN = function(x) sd(x)), by = "ID")
+temp$sample <- "EFF_2_all_20"
+temp$filter <- "NO"
+temp <- merge(temp, temp_2, by = "ID")
+temp$downsample <- 20
+colnames(temp) <- c("ID", "E_rel", "C_o", "R_FVE", "B_G", "gene_copies", "expected_conc", "sd_exp_conc", "predicted_conc", "sd_pred_conc", "sample", "filter", "nuc_acid", "downsample")
+
+stds_no_filter_2 <- subset(stds_no_filter_2, !(sample %in% c("EFF_2_1_20", "EFF_2_2_20", "EFF_2_3_20")))
+stds_no_filter_2 <- rbind.data.frame(stds_no_filter_2, temp)
+
+mapping_EFF_2 <- subset(stds_no_filter, sample %in% c("EFF_2_1_1", "EFF_2_2_1", "EFF_2_3_1"))
+temp <- aggregate(mapping_EFF_2["expected_conc"], mapping_EFF_2["ID"], FUN = function(x) mean(x))
+temp <- merge(aggregate(mapping_EFF_2["E_rel"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), aggregate(mapping_EFF_2["C_o"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_EFF_2["R_FVE"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_EFF_2["B_G"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_EFF_2["gene_copies"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_EFF_2["expected_conc"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp, aggregate(mapping_EFF_2["expected_conc"], mapping_EFF_2["ID"], FUN = function(x) sd(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_EFF_2["predicted_conc"], mapping_EFF_2["ID"], FUN = function(x) mean(x)), by = "ID")
+temp <- merge(temp,  aggregate(mapping_EFF_2["predicted_conc"], mapping_EFF_2["ID"], FUN = function(x) sd(x)), by = "ID")
+temp$sample <- "EFF_2_all_1"
+temp$filter <- "NO"
+temp <- merge(temp, temp_2, by = "ID")
+temp$downsample <- 1
+colnames(temp) <- c("ID", "E_rel", "C_o", "R_FVE", "B_G", "gene_copies", "expected_conc", "sd_exp_conc", "predicted_conc", "sd_pred_conc", "sample", "filter", "nuc_acid", "downsample")
+
+stds_no_filter_2 <- subset(stds_no_filter_2, !(sample %in% c("EFF_2_1_1", "EFF_2_2_1", "EFF_2_3_1")))
+stds_no_filter_2 <- rbind.data.frame(stds_no_filter_2, temp)
+```
+
+# Filter the predicted_conc by E_detect cut-offs
+```{r}
+STD_MIX <- read.table("Spike-ins/STD_MIXES.txt", header = TRUE, sep = "\t")
+STD_MIX <- cbind.data.frame("ID" = STD_MIX$ID, "length" = STD_MIX$length)
+
+stds_no_filter_2 <- merge.data.frame(stds_no_filter_2, STD_MIX, by = "ID")
+
+stds_filter <- stds_no_filter_2
+
+E_detect <- readRDS("Regressions/Langenfeld_2024_E_detect")
+
+stds_filter$E_detect <- predict(E_detect, newdata = stds_filter)
+
+stds_filter <- subset(stds_filter, E_rel >= E_detect)
+
+stds_filter <- stds_filter[,1:15]
+stds_filter$filter <- "YES"
+
+### total standards count that meet cut-off
+stds_no_filter <- merge.data.frame(stds_no_filter, STD_MIX, by = "ID")
+
+stds_filter_all <- stds_no_filter
+
+stds_filter_all$E_detect <- predict(E_detect, newdata = stds_filter_all)
+
+stds_filter_all <- subset(stds_filter_all, E_rel >= E_detect)
+```
+
+
+# Set up the dataframe for the figure
+```{r}
+fig_2_df <- rbind.data.frame(stds_no_filter_2, stds_filter)
+#colnames(fig_2_df) <- c("ID", "analysis_stage", "type", "expected", "sd_expected", "predicted", "sd_predicted", "matrix", "downsample")
+
+#fig_2_df$analysis_stage <- as.character(fig_2_df$analysis_stage)
+fig_2_df$filter[fig_2_df$filter == "YES"] <- "Detectable Results"
+fig_2_df$filter[fig_2_df$filter == "NO"] <- "Raw Results"
+
+#samples <- c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1", "EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1", "INF_1_1_20", "INF_2_1_20", "INF_2_2_20", "INF_2_3_20", "INF_3_1_20", "EFF_1_1_20", "EFF_2_1_20", "EFF_2_2_20", "EFF_2_3_20", "EFF_3_1_20", "INF_1_1_1", "INF_2_1_1", "INF_2_2_1", "INF_2_3_1", "INF_3_1_1", "EFF_1_1_1", "EFF_2_1_1", "EFF_2_2_1", "EFF_2_3_1", "EFF_3_1_1")
+
+#downsample <- c(rep(100, 10), rep(20, 10), rep(1, 10))
+sample_info$matrix_type <- c(rep(c(rep("Influent", 5), rep("Effluent", 5)),3))
+fig_2_df$matrix <- "Influent"
+fig_2_df$matrix[fig_2_df$sample %like% "EFF"] <- "Effluent"
+
+fig_2_df_v2 <- aggregate(fig_2_df[c("expected_conc")], fig_2_df[c("filter", "matrix", "downsample", "ID", "nuc_acid")], FUN = function(x) mean(x))
+temp <- aggregate(fig_2_df[c("expected_conc")], fig_2_df[c("filter", "matrix", "downsample", "ID", "nuc_acid")], FUN = function(x) sd(x))
+colnames(temp) <- c("filter", "matrix", "downsample", "ID", "nuc_acid", "sd_expect_conc")
+fig_2_df_v2 <- merge.data.frame(fig_2_df_v2, temp, by = c("filter", "matrix", "downsample", "ID", "nuc_acid"))
+temp <- aggregate(fig_2_df[c("predicted_conc")], fig_2_df[c("filter", "matrix", "downsample", "ID", "nuc_acid")], FUN = function(x) mean(x))
+colnames(temp) <- c("filter", "matrix", "downsample", "ID", "nuc_acid", "predicted_conc")
+fig_2_df_v2 <- merge.data.frame(fig_2_df_v2, temp, by = c("filter", "matrix", "downsample", "ID", "nuc_acid"))
+temp <- aggregate(fig_2_df[c("predicted_conc")], fig_2_df[c("filter", "matrix", "downsample", "ID", "nuc_acid")], FUN = function(x) sd(x))
+colnames(temp) <- c("filter", "matrix", "downsample", "ID", "nuc_acid", "sd_pred_conc")
+fig_2_df_v2 <- merge.data.frame(fig_2_df_v2, temp, by = c("filter", "matrix", "downsample", "ID", "nuc_acid"))
+```
+
+```{r}
+fig_2_df_v3 <- aggregate(fig_2_df[c("expected_conc")], fig_2_df[c("filter", "downsample", "ID", "nuc_acid")], FUN = function(x) mean(x))
+temp <- aggregate(fig_2_df[c("expected_conc")], fig_2_df[c("filter", "downsample", "ID", "nuc_acid")], FUN = function(x) sd(x))
+colnames(temp) <- c("filter", "downsample", "ID", "nuc_acid", "sd_expect_conc")
+fig_2_df_v3 <- merge.data.frame(fig_2_df_v3, temp, by = c("filter", "downsample", "ID", "nuc_acid"))
+temp <- aggregate(fig_2_df[c("predicted_conc")], fig_2_df[c("filter", "downsample", "ID", "nuc_acid")], FUN = function(x) mean(x))
+colnames(temp) <- c("filter", "downsample", "ID", "nuc_acid", "predicted_conc")
+fig_2_df_v3 <- merge.data.frame(fig_2_df_v3, temp, by = c("filter", "downsample", "ID", "nuc_acid"))
+temp <- aggregate(fig_2_df[c("predicted_conc")], fig_2_df[c("filter", "downsample", "ID", "nuc_acid")], FUN = function(x) sd(x))
+colnames(temp) <- c("filter", "downsample", "ID", "nuc_acid", "sd_pred_conc")
+fig_2_df_v3 <- merge.data.frame(fig_2_df_v3, temp, by = c("filter", "downsample", "ID", "nuc_acid"))
+```
+
+
+Create figure and save it to the "QuantMeta_Paper_Analysis/manuscript_figures" directory
+```{r}
+fig_2_df_v3$filter <- factor(fig_2_df_v3$filter, levels = c("Raw Results", "Detectable Results"))
+
+my.formula <- y ~ x
+fig_2 <- ggplot(fig_2_df_v3, aes(x = predicted_conc, y = expected_conc, color = nuc_acid, group = filter)) + facet_grid(.~filter) +
+  geom_pointrange(aes(xmin = predicted_conc - sd_pred_conc, xmax = predicted_conc + sd_pred_conc), shape = 1, size = 0.2) +
+  pretty_plot + geom_smooth(method = "lm", se = FALSE, color = "black", formula = my.formula) +
+  stat_poly_eq(formula = my.formula, 
+               aes(label = paste(..eq.label.., ..rr.label.., sep = "~~"), size = 12),
+               parse = TRUE) +
+  labs(x = "Predicted Gene Copies (copies/µL)", y = "Expected Concentration (copies/µL)", color = "Standard\nType") +
+  scale_colour_brewer(palette = "Dark2") +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+
+fig_2
+```
+
+```{r}
+detected_stds <- subset(fig_2_df_v3, filter == "Detectable Results")
+
+my.formula <- log10(expected_conc) ~ log10(predicted_conc)
+
+quant_reg <- lm(my.formula, detected_stds)
+```
+
+### check that the predicted gene copies and expected concentrations are log-normally distributed with Wilkes-Shapiro test
+```{r}
+temp <- subset(fig_2_df_v3, filter == "Detectable Results" & downsample == 100)
+
+histogram(log10(temp$expected_conc))
+histogram(log10(temp$predicted_conc))
+
+shapiro.test(log10(temp$expected_conc))
+shapiro.test(log10(temp$predicted_conc))
+```
+
+```{r}
+fig_2_df_v4 <- fig_2_df_v3
+fig_2_df_v4$predicted_conc[fig_2_df_v4$nuc_acid == "ssDNA"] <- fig_2_df_v4$predicted_conc[fig_2_df_v4$nuc_acid == "ssDNA"]*2
+
+my.formula <- y ~ x
+fig_2 <- ggplot(fig_2_df_v4, aes(x = predicted_conc, y = expected_conc, color = nuc_acid, group = filter)) + facet_grid(.~filter) +
+  geom_pointrange(aes(xmin = predicted_conc - sd_pred_conc, xmax = predicted_conc + sd_pred_conc), shape = 1, size = 0.2) +
+  pretty_plot + 
+  geom_smooth(method = "lm", se = FALSE, color = "black", formula = my.formula) +
+  stat_poly_eq(formula = my.formula, 
+              aes(label = paste(..eq.label.., ..rr.label.., sep = "~~"), size = 12),
+               parse = TRUE) +
+  labs(x = "Predicted Gene Copies (copies/µL)", y = "Expected Concentration (copies/µL)", color = "Standard\nType") +
+  scale_colour_brewer(palette = "Dark2") +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+
+fig_2 
+
+ggsave("figures/Figure_2.png", plot = last_plot(), width = 10, height = 6, dpi = 400, units = "in", limitsize = TRUE)
+
+cairo_pdf("figures/Figure_2.pdf", width = 10, height = 6)
+fig_2
+dev.off()
+```
+
+```{r}
+detected_stds <- subset(fig_2_df_v4, filter == "Detectable Results")
+
+my.formula <- log10(expected_conc) ~ log10(predicted_conc)
+
+quant_reg <- lm(my.formula, detected_stds)
+
+saveRDS(quant_reg, file = "Regressions/Langenfeld_2024_rel_to_abs")
+```
+
+```{r}
+temp <-subset(fig_2_df_v4, filter == "Raw Results")
+temp1 <- subset(fig_2_df_v4, filter == "Detectable Results")
+temp$ID_2 <- paste(temp$ID, temp$downsample, sep = ":")
+temp1$ID_2 <- paste(temp1$ID, temp1$downsample, sep = ":")
+temp <- subset(temp, !(ID_2 %in% temp1$ID_2))
+
+max(temp$expected_conc)
+median(temp$expected_conc)
+min(temp$expected_conc)
+```
+
+
+# Figure S1 -- dsDNA vs. ssDNA standard quantification (notice that in Fig 2 the ssDNA standards are above the dsDNA standard points)
+```{r}
+fig_2_df$virome_conc <- 10^predict(quant_reg, fig_2_df)
+fig_2_df_nodown <- subset(fig_2_df, downsample == 100 & filter == "Detectable Results")
+
+my.formula <- y ~ x
+ggplot(data = fig_2_df_nodown, aes(x = virome_conc, y = expected_conc, colour = nuc_acid)) +
+  geom_smooth(method = "lm", se = FALSE, color = "black", formula = my.formula) +
+  stat_poly_eq(formula = my.formula, 
+               aes(label = paste(..eq.label.., ..rr.label.., sep = "~~"), size = 12),
+               parse = TRUE) +
+  geom_point(shape = 1) + pretty_plot + labs(x = "Virome Derived Concentration (copies/µL)", y = "ddPCR Measured Concentration (copies/µL)") + theme(legend.title = element_blank()) +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+
+
+# LM model for anova test to determine if ssDNA is different than dsDNA
+all.lm <- lm(formula = log10(expected_conc) ~ log10(virome_conc), data = fig_2_df_nodown)
+type_specific.lm <- lm(formula = log10(expected_conc) ~ log10(virome_conc) + nuc_acid, data = fig_2_df_nodown)
+
+anova(all.lm, type_specific.lm)
+
+invertres.lm <- lm(formula = log10(virome_conc) ~ log10(expected_conc), data = fig_2_df_nodown)
+residuals <- data.frame(resid(invertres.lm))
+colnames(residuals) <- c("residuals")
+fig_2_df_nodown <- cbind.data.frame(fig_2_df_nodown, residuals)
+
+DNA_type <- ggplot(data = fig_2_df_nodown, aes(x = nuc_acid, y = residuals)) + 
+  geom_violin(trim=FALSE, fill = "gray") + pretty_plot + labs(x = "Type of Nucliec Acid", y = "Linear Regression Residuals") + 
+  geom_hline(yintercept=0, linetype = 2) + geom_boxplot(width=0.1)
+
+DNA_type
+
+t.test(fig_2_df_nodown$residuals~fig_2_df_nodown$nuc_acid, var.equal=TRUE)
+
+# Separate linear regression models
+ssDNA_results <- subset(fig_2_df_nodown, nuc_acid == "ssDNA")
+ssDNA.lm <- lm(formula = log10(expected_conc) ~ log10(virome_conc), data = ssDNA_results)
+summary(ssDNA.lm)
+
+dsDNA_results <- subset(fig_2_df_nodown, nuc_acid == "dsDNA")
+dsDNA.lm <- lm(formula = log10(expected_conc) ~ log10(virome_conc), data = dsDNA_results)
+summary(dsDNA.lm)
+
+### relative percent difference between separate regressions for dsDNA and ssDNA standards
+test_set <- data.frame("test_count" = c(1:14), "virome_conc" = c(1000, 1146, 5893, 8925, 15467, 24399, 60231, 97512, 241009, 678900, 1764033, 4500123, 8943201, 1E7))
+test_set$ssDNA <- predict(ssDNA.lm, newdata = test_set)
+test_set$dsDNA <- predict(dsDNA.lm, newdata = test_set)
+test_set$diff <- test_set$ssDNA - test_set$dsDNA
+test_set$mean <- apply(test_set[,3:4], 1, mean)
+test_set$rel_diff <- test_set$diff/test_set$mean
+```
+
+# Figure S1 -- dsDNA vs. ssDNA standard quantification (notice that in Fig 2 the ssDNA standards are above the dsDNA standard points)
+```{r}
+fig_2_df_v2 <- fig_2_df
+fig_2_df_v2$predicted_conc[fig_2_df_v2$nuc_acid == "ssDNA"] <- 2*fig_2_df_v2$predicted_conc[fig_2_df_v2$nuc_acid == "ssDNA"]
+fig_2_df_v2$virome_conc <- 10^predict(quant_reg, fig_2_df_v2)
+fig_2_df_v2_nodown <- subset(fig_2_df_v2, downsample == 100 & filter == "Detectable Results")
+
+my.formula <- y ~ x
+ggplot(data = fig_2_df_v2_nodown, aes(x = virome_conc, y = expected_conc, colour = nuc_acid)) +
+  geom_smooth(method = "lm", se = FALSE, color = "black", formula = my.formula) +
+  stat_poly_eq(formula = my.formula, 
+               aes(label = paste(..eq.label.., ..rr.label.., sep = "~~"), size = 12),
+               parse = TRUE) +
+  geom_point(shape = 1) + pretty_plot + labs(x = "Virome Derived Concentration (copies/µL)", y = "ddPCR Measured Concentration (copies/µL)") + theme(legend.title = element_blank()) +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+
+
+# LM model for anova test to determine if ssDNA is different than dsDNA
+all.lm <- lm(formula = log10(expected_conc) ~ log10(virome_conc), data = fig_2_df_v2_nodown)
+type_specific.lm <- lm(formula = log10(expected_conc) ~ log10(virome_conc) + nuc_acid, data = fig_2_df_v2_nodown)
+
+anova(all.lm, type_specific.lm)
+
+invertres.lm <- lm(formula = log10(virome_conc) ~ log10(expected_conc), data = fig_2_df_v2_nodown)
+residuals <- data.frame(resid(invertres.lm))
+colnames(residuals) <- c("residuals")
+fig_2_df_v2_nodown <- cbind.data.frame(fig_2_df_v2_nodown, residuals)
+
+DNA_type <- ggplot(data = fig_2_df_v2_nodown, aes(x = nuc_acid, y = residuals)) + 
+  geom_violin(trim=FALSE, fill = "gray") + pretty_plot + labs(x = "Type of Nucliec Acid", y = "Linear Regression Residuals") + 
+  geom_hline(yintercept=0, linetype = 2) + geom_boxplot(width=0.1)
+
+DNA_type
+
+ggsave("figures/ssDNA_v_dsDNA_residuals.png", plot = last_plot(), scale = 2, dpi = 320, limitsize = TRUE)
+
+cairo_pdf("figures/Figure_S1.pdf")
+DNA_type
+dev.off()
+
+t.test(fig_2_df_v2_nodown$residuals~fig_2_df_v2_nodown$nuc_acid, var.equal=TRUE)
+
+# Separate linear regression models
+ssDNA_results <- subset(fig_2_df_v2_nodown, nuc_acid == "ssDNA")
+ssDNA.lm <- lm(formula = log10(expected_conc) ~ log10(virome_conc), data = ssDNA_results)
+summary(ssDNA.lm)
+
+dsDNA_results <- subset(fig_2_df_v2_nodown, nuc_acid == "dsDNA")
+dsDNA.lm <- lm(formula = log10(expected_conc) ~ log10(virome_conc), data = dsDNA_results)
+summary(dsDNA.lm)
+
+### relative percent difference between separate regressions for dsDNA and ssDNA standards
+test_set <- data.frame("test_count" = c(1:14), "virome_conc" = c(1000, 1146, 5893, 8925, 15467, 24399, 60231, 97512, 241009, 678900, 1764033, 4500123, 8943201, 1E7))
+test_set$ssDNA <- predict(ssDNA.lm, newdata = test_set)
+test_set$dsDNA <- predict(dsDNA.lm, newdata = test_set)
+test_set$diff <- test_set$ssDNA - test_set$dsDNA
+test_set$mean <- apply(test_set[,3:4], 1, mean)
+test_set$rel_diff <- test_set$diff/test_set$mean
+```
+
+### Analyze technical replicates -- how reproducible is quantitative metagenomics?
+Look at INF_2_1 vs. INF_2_2 vs. INF_2_3 and EFF_2_1 vs. EFF_2_2 vs. EFF_2_3
+```{r}
+sample_info <- as.data.frame(read.table(file = "Spike-ins/2021_WW_sample_info.txt", sep = '\t', header = TRUE, stringsAsFactors = FALSE))
+
+spike_conc <- as.data.frame(read.table("Spike-ins/2021_WW_stds_ddPCR_conc.txt", header = TRUE, sep = '\t', stringsAsFactors = FALSE))
+
+samples <- data.frame(c("INF_2_1", "INF_2_2", "INF_2_3", "EFF_2_1", "EFF_2_2", "EFF_2_3"))
+main_sample <- data.frame(c("INF_2", "INF_2", "INF_2", "EFF_2", "EFF_2", "EFF_2"))
+rep_num <- data.frame(c(1, 2, 3, 1, 2, 3))
+
+std_mapping_list <- c("Mapping/INF_2_1/standards_0/standards_mapping_analysis.txt", "Mapping/INF_2_2/standards_0/standards_mapping_analysis.txt", "Mapping/INF_2_3/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_2_1/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_2_2/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_2_3/standards_0/standards_mapping_analysis.txt")
+
+
+prediction <- function (mapping, DNA_input, DNA_conc) {
+  pred_conc_calc <- function(copies, mass, conc) {
+    predicted <- copies*conc/mass
+    # (gene copy standard_x)/(µL DNA extract) = gene copies standard_x/ng total DNA*(ng DNA/µL DNA extract)
+    return(predicted)
+  }
+  
+  result = data.frame(mapping$ID)
+  result$predicted_conc <- pred_conc_calc(as.numeric(mapping$gene_copies), DNA_input, DNA_conc)
+  colnames(result) <- c("ID", "predicted_conc")
+  
+  return(result)
+}
+
+for (i in 1:nrow(samples)) {
+  mapping <- read.table(std_mapping_list[i], header = TRUE, sep = "\t")
+  temp <- samples[i,1]
+  ddPCR_temp <- data.frame("ID" = spike_conc$ID, "expected_conc" = as.numeric(spike_conc[,temp]))
+  ddPCR_temp$expected_conc <- ddPCR_temp$expected_conc
+  mapping <- merge.data.frame(mapping, ddPCR_temp, by = "ID", all.y = TRUE)
+  temp <- prediction(mapping, sample_info$lib_mass, sample_info$DNA_conc)
+  mapping <- merge.data.frame(mapping, temp, by = "ID")
+  mapping$sample <- samples[i,1]
+  mapping$main_sample <- main_sample[i,1]
+  mapping$replicate <- rep_num[i,1]
+  mapping$nuc_acid <- "dsDNA"
+  mapping$nuc_acid[mapping$ID %in% c("NC_000936.1_S3", "NC_027637.1_S2", "NC_039057.1_S1", "NC_025708.1_S1", "NC_010429.1_S4")] <- "ssDNA"
+  
+  if (i == 1) {
+    tech_reps <- mapping
+  } 
+  else {
+    tech_reps <- rbind.data.frame(tech_reps, mapping)
+  }
+}
+
+tech_reps$E_rel[is.na(tech_reps$E_rel)] <- 0
+tech_reps$predicted_conc[is.na(tech_reps$predicted_conc)] <- 0
+```
+
+ANOVA test for Influent and Effluent (separately) does the sample name impact the predicted concentrations?
+```{r}
+ggplot(tech_reps, aes(x=log10(expected_conc), y=log10(predicted_conc), color=main_sample)) +
+  geom_point() + pretty_plot
+
+### Make a separate column with the (pred - exp)/pred
+#tech_reps$conc_diff <- abs(tech_reps$predicted_conc - tech_reps$expected_conc)/tech_reps$expected_conc
+
+ggplot(tech_reps, aes(x =factor(replicate), y=predicted_conc)) +
+  geom_boxplot() + ylab("Observed Relative Abundance") + xlab("Replicate") +
+  facet_grid(.~main_sample)+
+  pretty_plot
+
+histogram(tech_reps$predicted_conc)
+### large enough sample set that normality is not required -- n = 91 (> 30)
+
+### ANOVA of the technical replicates for the influent sample
+inf_tech_reps <- subset(tech_reps, main_sample == "INF_2")
+inf_tech_rep_anova <- aov(expected_conc ~ predicted_conc + factor(replicate), data = inf_tech_reps)
+summary(inf_tech_rep_anova)
+
+inf_tech_reps <- subset(inf_tech_reps, predicted_conc > 0)
+inf_tech_reps_summary <- aggregate(inf_tech_reps[c("predicted_conc")], inf_tech_reps[c("ID", "nuc_acid", "main_sample")], FUN = function(x) sd(x)/mean(x))
+colnames(inf_tech_reps_summary) <- c("ID", "nuc_acid", "main_sample", "Rel_SD")
+temp <- aggregate(inf_tech_reps[c("predicted_conc")], inf_tech_reps[c("ID", "nuc_acid", "main_sample")], FUN = function(x) length(x))
+colnames(temp) <- c("ID", "nuc_acid", "main_sample", "Num_Reps")
+inf_tech_reps_summary <- merge.data.frame(inf_tech_reps_summary, temp, by = c("ID", "nuc_acid", "main_sample"))
+temp <- aggregate(inf_tech_reps[c("predicted_conc")], inf_tech_reps[c("ID", "nuc_acid", "main_sample")], FUN = function(x) mean(log10(x)))
+colnames(temp) <- c("ID", "nuc_acid", "main_sample", "Mean")
+inf_tech_reps_summary <- merge.data.frame(inf_tech_reps_summary, temp, by = c("ID", "nuc_acid", "main_sample"))
+
+ggplot(inf_tech_reps_summary, aes(x=Mean, y=Rel_SD)) +
+  geom_point() + pretty_plot
+
+mean(subset(inf_tech_reps_summary, Num_Reps == 3 & Mean >= 1)$Rel_SD)
+
+### ANOVA of the technical replicates for the effluent sample
+eff_tech_reps <- subset(tech_reps, main_sample == "EFF_2")
+eff_tech_rep_anova <- aov(expected_conc ~ predicted_conc +factor(replicate), data = eff_tech_reps)
+summary(eff_tech_rep_anova)
+
+eff_tech_reps <- subset(eff_tech_reps, predicted_conc > 0)
+eff_tech_reps_summary <- aggregate(eff_tech_reps[c("predicted_conc")], eff_tech_reps[c("ID", "nuc_acid", "main_sample")], FUN = function(x) sd(x)/mean(x))
+colnames(eff_tech_reps_summary) <- c("ID", "nuc_acid", "main_sample", "Rel_SD")
+temp <- aggregate(eff_tech_reps[c("predicted_conc")], eff_tech_reps[c("ID", "nuc_acid", "main_sample")], FUN = function(x) length(x))
+colnames(temp) <- c("ID", "nuc_acid", "main_sample", "Num_Reps")
+eff_tech_reps_summary <- merge.data.frame(eff_tech_reps_summary, temp, by = c("ID", "nuc_acid", "main_sample"))
+temp <- aggregate(eff_tech_reps[c("predicted_conc")], eff_tech_reps[c("ID", "nuc_acid", "main_sample")], FUN = function(x) mean(log10(x)))
+colnames(temp) <- c("ID", "nuc_acid", "main_sample", "Mean")
+eff_tech_reps_summary <- merge.data.frame(eff_tech_reps_summary, temp, by = c("ID", "nuc_acid", "main_sample"))
+
+ggplot(eff_tech_reps_summary, aes(x=Mean, y=Rel_SD)) +
+  geom_point() + pretty_plot
+
+mean(subset(eff_tech_reps_summary, Num_Reps == 3 & Mean >= 1)$Rel_SD)
+```
+
+How much variation is there between the different samples that I spiked the standards (at the same concentration) into?
+```{r}
+samples <- data.frame(c("INF_1_1", "INF_3_1", "EFF_1_1", "EFF_3_1"))
+main_sample <- data.frame(c("INF_1", "INF_3", "EFF_1", "EFF_3"))
+rep_num <- data.frame(c(1, 1, 1, 1))
+
+std_mapping_list <- c("Mapping/INF_1_1/standards_0/standards_mapping_analysis.txt", "Mapping/INF_3_1/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_1_1/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_3_1/standards_0/standards_mapping_analysis.txt")
+
+
+prediction <- function (mapping, DNA_input, DNA_conc) {
+  pred_conc_calc <- function(copies, mass, conc) {
+    predicted <- copies*conc/mass
+    # (gene copy standard_x)/(µL DNA extract) = gene copies standard_x/ng total DNA*(ng DNA/µL DNA extract)
+    return(predicted)
+  }
+  
+  result = data.frame(mapping$ID)
+  result$predicted_conc <- pred_conc_calc(as.numeric(mapping$gene_copies), DNA_input, DNA_conc)
+  colnames(result) <- c("ID", "predicted_conc")
+  
+  return(result)
+}
+
+for (i in 1:nrow(samples)) {
+  mapping <- read.table(std_mapping_list[i], header = TRUE, sep = "\t")
+  temp <- samples[i,1]
+  ddPCR_temp <- data.frame("ID" = spike_conc$ID, "expected_conc" = as.numeric(spike_conc[,temp]))
+  ddPCR_temp$expected_conc <- ddPCR_temp$expected_conc
+  mapping <- merge.data.frame(mapping, ddPCR_temp, by = "ID", all.y = TRUE)
+  temp <- prediction(mapping, sample_info$lib_mass, sample_info$DNA_conc)
+  mapping <- merge.data.frame(mapping, temp, by = "ID")
+  mapping$sample <- samples[i,1]
+  mapping$main_sample <- main_sample[i,1]
+  mapping$replicate <- rep_num[i,1]
+  mapping$nuc_acid <- "dsDNA"
+  mapping$nuc_acid[mapping$ID %in% c("NC_000936.1_S3", "NC_027637.1_S2", "NC_039057.1_S1", "NC_025708.1_S1", "NC_010429.1_S4")] <- "ssDNA"
+  
+  if (i == 1) {
+    exp_reps <- mapping
+  } 
+  else {
+    exp_reps <- rbind.data.frame(exp_reps, mapping)
+  }
+}
+
+exp_reps$E_rel[is.na(exp_reps$E_rel)] <- 0
+exp_reps$predicted_conc[is.na(exp_reps$predicted_conc)] <- 0
+```
+
+Add in the two samples that technical replicates included
+```{r}
+temp <- aggregate(tech_reps[c("E_rel", "C_o", "R_FVE", "B_G", "gene_copies", "expected_conc", "predicted_conc")], tech_reps[c("ID", "main_sample", "nuc_acid")], FUN = function(x) {mean(x)})
+temp$replicate <- 1
+temp$sample <- "INF_2_all"
+temp$sample[temp$main_sample == "EFF_2"] <- "EFF_2_all"
+
+exp_reps <- rbind.data.frame(exp_reps, temp)
+```
+
+ANOVA test for all samples-- does the sample name impact the predicted concentrations?
+```{r}
+ggplot(exp_reps, aes(x=log10(expected_conc), y=log10(predicted_conc), color=main_sample)) +
+  geom_point() + pretty_plot
+
+ggplot(exp_reps, aes(x =factor(replicate), y=predicted_conc)) +
+  geom_boxplot() + ylab("Observed Relative Abundance") + xlab("Replicate") +
+  facet_grid(.~main_sample)+
+  pretty_plot
+
+histogram(exp_reps$predicted_conc)
+### large enough sample set that normality is not required -- n = 91 (> 30)
+
+### ANOVA of all samples
+exp_rep_anova <- aov(expected_conc ~ predicted_conc + factor(main_sample), data = exp_reps)
+summary(exp_rep_anova)
+
+exp_reps$sample_type <- "Influent"
+exp_reps$sample_type[exp_reps$main_sample %in% c("EFF_1", "EFF_2", "EFF_3")] <- "Effluent"
+exp_rep_anova <- aov(expected_conc ~ predicted_conc + factor(sample_type), data = exp_reps)
+summary(exp_rep_anova) 
+
+exp_reps <- subset(exp_reps, predicted_conc > 0)
+exp_reps_summary <- aggregate(exp_reps[c("predicted_conc")], exp_reps[c("ID", "nuc_acid")], FUN = function(x) {sd(x)/mean(x)})
+colnames(exp_reps_summary) <- c("ID", "nuc_acid", "Rel_SD")
+temp <- aggregate(exp_reps[c("predicted_conc")], exp_reps[c("ID", "nuc_acid")], FUN = function(x) length(x))
+colnames(temp) <- c("ID", "nuc_acid", "Num_Reps")
+exp_reps_summary <- merge.data.frame(exp_reps_summary, temp, by = c("ID", "nuc_acid"))
+temp <- aggregate(exp_reps[c("predicted_conc")], exp_reps[c("ID", "nuc_acid")], FUN = function(x) mean(log10(x)))
+colnames(temp) <- c("ID", "nuc_acid", "Mean")
+exp_reps_summary <- merge.data.frame(exp_reps_summary, temp, by = c("ID", "nuc_acid"))
+
+ggplot(exp_reps_summary, aes(x=Mean, y=Rel_SD)) +
+  geom_point() + pretty_plot
+
+mean(exp_reps_summary$Rel_SD)
+
+### ANOVA of the technical replicates for the influent sample
+inf_exp_reps <- subset(exp_reps, main_sample %in% c("INF_1", "INF_2", "INF_3"))
+inf_exp_rep_anova <- aov(expected_conc ~ predicted_conc + factor(main_sample), data = inf_exp_reps)
+summary(inf_exp_rep_anova)
+
+inf_exp_reps <- subset(inf_exp_reps, predicted_conc > 0)
+inf_exp_reps_summary <- aggregate(inf_exp_reps[c("predicted_conc")], inf_exp_reps[c("ID", "nuc_acid")], FUN = function(x) sd(x)/mean(x))
+colnames(inf_exp_reps_summary) <- c("ID", "nuc_acid", "Rel_SD")
+temp <- aggregate(inf_exp_reps[c("predicted_conc")], inf_exp_reps[c("ID", "nuc_acid")], FUN = function(x) length(x))
+colnames(temp) <- c("ID", "nuc_acid", "Num_Reps")
+inf_exp_reps_summary <- merge.data.frame(inf_exp_reps_summary, temp, by = c("ID", "nuc_acid"))
+temp <- aggregate(inf_exp_reps[c("predicted_conc")], inf_exp_reps[c("ID", "nuc_acid")], FUN = function(x) mean(log10(x)))
+colnames(temp) <- c("ID", "nuc_acid", "Mean")
+inf_exp_reps_summary <- merge.data.frame(inf_exp_reps_summary, temp, by = c("ID", "nuc_acid"))
+
+ggplot(inf_exp_reps_summary, aes(x=Mean, y=Rel_SD)) +
+  geom_point() + pretty_plot
+
+### ANOVA of the technical replicates for the effluent sample
+eff_exp_reps <- subset(exp_reps, main_sample %in% c("EFF_1", "EFF_2", "EFF_3"))
+eff_exp_rep_anova <- aov(expected_conc ~ predicted_conc +factor(main_sample), data = eff_exp_reps)
+summary(eff_exp_rep_anova)
+
+eff_exp_reps <- subset(eff_exp_reps, predicted_conc > 0)
+eff_exp_reps_summary <- aggregate(eff_exp_reps[c("predicted_conc")], eff_exp_reps[c("ID", "nuc_acid")], FUN = function(x) sd(x)/mean(x))
+colnames(eff_exp_reps_summary) <- c("ID", "nuc_acid", "Rel_SD")
+temp <- aggregate(eff_exp_reps[c("predicted_conc")], eff_exp_reps[c("ID", "nuc_acid")], FUN = function(x) length(x))
+colnames(temp) <- c("ID", "nuc_acid", "Num_Reps")
+eff_exp_reps_summary <- merge.data.frame(eff_exp_reps_summary, temp, by = c("ID", "nuc_acid"))
+temp <- aggregate(eff_exp_reps[c("predicted_conc")], eff_exp_reps[c("ID", "nuc_acid")], FUN = function(x) mean(log10(x)))
+colnames(temp) <- c("ID", "nuc_acid", "Mean")
+eff_exp_reps_summary <- merge.data.frame(eff_exp_reps_summary, temp, by = c("ID", "nuc_acid"))
+
+ggplot(eff_exp_reps_summary, aes(x=Mean, y=Rel_SD)) +
+  geom_point() + pretty_plot
+
+```

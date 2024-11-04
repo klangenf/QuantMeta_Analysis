@@ -1,0 +1,793 @@
+---
+title: "Analysis of virus quantities"
+output: html_notebook
+---
+
+Purpose: Develop the read depth variability threshold and figures related to mapping reads to standard contigs
+
+Load required libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+library(MASS)
+library(scales)
+library(gridExtra)
+library(cowplot)
+library(ggpmisc)
+library(ggpubr)
+library(EnvStats)
+library(permute)
+library(lattice)
+library(vegan)
+library(parallel)
+library(tcltk)
+library(knitr)
+library(markdown)
+library(cluster)
+library(mgcv)
+library(utils)
+library(stats)
+library(data.table)
+library(RColorBrewer)
+library(tidyr)
+
+pretty_plot <- theme_classic() + theme(
+  #text = element_text(family = "Lucinda Sans", color = "black"),
+  plot.margin = margin(1,1,1,1, "cm"),
+  axis.line.x.bottom = element_line(color = "black", size = 0.5),
+  axis.line.y.left = element_line(color = "black", size = 0.5),
+  panel.border = element_rect(colour="black", fill = NA, size = 0.5),
+  strip.background = element_blank(),
+  strip.text = element_text(size = 12),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  plot.title = element_text(size = 15),
+  axis.title = element_text(size = 12), 
+  axis.text.y = element_text(size = 12, color = "#000000"),
+  axis.text.x = element_text(size = 12, color = "#000000"))
+```
+
+##### Analyze absolute abundance of crAssphage, adenovirus, and polyomavirus in the samples ########
+```{r}
+samples <- c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1", "EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1")
+
+abund_table <- cbind.data.frame(samples, 0, 0, 0, 0, 0, 0, 0)
+colnames(abund_table) <- c("sample", "crAssphage", "adenovirus", "polyomavirus", "HM1", "crAss_primer", "JC_poly", "BK_poly")
+
+abund_calc <- function(target_list, abundance_list) {
+  temp <- subset(abundance_list, ID %in% target_list)
+  return(sum(temp$concentration))
+}
+
+crAss_primers_list <- c("MW063138.1", "MW067003.1", "MW067002.1", "MW067001.1", "MW067000.1", "MT006214.1", "MK415410.1", "MK415408.1", "MK415404.1", "MK415403.1", "MK238400.1", "NC_024711.1", "BK049789.1", "MZ130481.1", "MK415399.1")
+
+JC_poly_list <- c("NC_001699.1")
+
+BK_poly_list <- c("NC_001538.1")
+
+for (i in samples) {
+  filename <- "Results/sample/crAssphage_contigs_results.txt" ####changed from viral_bins_derep
+  filename <- gsub("sample", i, filename)
+  abundance <- data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  colnames(abundance) <- c("ID", "concentration", "std_dev")
+  
+  filename <- "Mapping/sep_contigs/sample/crAssphage_contigs_matching.txt"
+  filename <- gsub("sample", i, filename)
+  if (file.size(filename) == 0) {
+    abund_table$crAssphage[abund_table$sample == i] <- NA
+    abund_table$crAss_primer[abund_table$sample == i] <- NA
+  } else {
+    cAp_temp <- data.frame(read.table(filename, header = FALSE, sep = "\t", stringsAsFactors = FALSE))
+    colnames(cAp_temp) <- c("contig_ID", "NCBI_accession")
+    cAp_contigs <- unique(cAp_temp$contig_ID)
+    abund_table$crAssphage[abund_table$sample == i] <- abund_calc(cAp_contigs, abundance)
+    
+    crAss_primers_contigs <- subset(cAp_temp, NCBI_accession %in% crAss_primers_list)
+    crAss_primers_contigs <- unique(crAss_primers_contigs$contig_ID)
+    abund_table$crAss_primer[abund_table$sample == i] <- abund_calc(crAss_primers_contigs, abundance)
+  }
+  
+#  filename <- "Mapping/sep_contigs/sample/human_adenovirus_contigs_matching.txt"
+ # filename <- gsub("sample", i, filename)
+  #if (file.size(filename) == 0) {
+   # abund_table$adenovirus[abund_table$sample == i] <- NA
+#  } else {
+ #   adeno_temp <- data.frame(read.table(filename, header = FALSE, sep = "\t"))
+  #  colnames(adeno_temp) <- c("contig_ID", "NCBI_accession")
+   # adeno_contigs <- unique(adeno_temp$contig_ID)
+    #abund_table$adenovirus[abund_table$sample == i] <- abund_calc(adeno_contigs, abundance)
+  #}
+  
+}
+
+poly_samples <- c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1")
+for (i in poly_samples) {
+  filename <- "Results/sample/polyomavirus_contigs_results.txt" ####changed from viral_bins_derep
+  filename <- gsub("sample", i, filename)
+  abundance <- data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  colnames(abundance) <- c("ID", "concentration", "std_dev")
+  
+  filename <- "Mapping/sep_contigs/sample/polyomavirus_contigs_matching.txt"
+  filename <- gsub("sample", i, filename)
+  if (file.size(filename) == 0) {
+    abund_table$polyomavirus[abund_table$sample == i] <- NA
+    abund_table$JC_poly[abund_table$sample == i] <- NA
+    abund_table$BK_poly[abund_table$sample == i] <- NA
+  } else {
+    poly_temp <- data.frame(read.table(filename, header = FALSE, sep = "\t", stringsAsFactors = FALSE))
+    colnames(poly_temp) <- c("contig_ID", "NCBI_accession")
+    poly_contigs <- unique(poly_temp$contig_ID)
+    abund_table$polyomavirus[abund_table$sample == i] <- abund_calc(poly_contigs, abundance)
+    
+    JC_poly_contigs <- subset(poly_temp, NCBI_accession %in% JC_poly_list)
+    JC_poly_contigs <- unique(JC_poly_contigs$contig_ID)
+    abund_table$JC_poly[abund_table$sample == i] <- abund_calc(JC_poly_contigs, abundance)
+    
+    BK_poly_contigs <- subset(poly_temp, NCBI_accession %in% BK_poly_list)
+    BK_poly_contigs <- unique(BK_poly_contigs$contig_ID)
+    abund_table$BK_poly[abund_table$sample == i] <- abund_calc(BK_poly_contigs, abundance)
+  }
+}
+
+HM1_samples <- c("INF_1_1", "INF_2_2", "INF_3_1", "EFF_1_1", "EFF_2_1")
+for (i in HM1_samples) {
+  filename <- "Results/sample/HM1_contigs_results.txt" ####changed from viral_bins_derep
+  filename <- gsub("sample", i, filename)
+  abundance <- data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  colnames(abundance) <- c("ID", "concentration", "std_dev")
+  
+  filename <- "Mapping/sep_contigs/sample/HM1_contigs_matching.txt"
+  filename <- gsub("sample", i, filename)
+  if (file.size(filename) == 0) {
+    abund_table$HM1[abund_table$sample == i] <- NA
+  } else {
+    HM1_temp <- data.frame(read.table(filename, header = FALSE, sep = "\t"))
+    colnames(HM1_temp) <- c("contig_ID", "NCBI_accession")
+    HM1_contigs <- unique(HM1_temp$contig_ID)
+    abund_table$HM1[abund_table$sample == i] <- abund_calc(HM1_contigs, abundance)
+  }
+}
+
+### remove the recovery term to the calculation (multiply by recovery)
+temp <- read.table("Sample_Characteristics/2021_WW_extraction_info.txt", sep = "\t", header = TRUE)
+abund_table[,2:8] <- apply(abund_table[,2:8], 2, FUN = function(x) {temp$recovery*x})
+temp <- rbind.data.frame(abund_table[1, 2:8], apply(abund_table[2:4, 2:8], 2, mean), abund_table[5, 2:8], abund_table[6, 2:8], apply(abund_table[7:9, 2:8], 2, mean), abund_table[10, 2:8])
+
+abund_table_v2 <- cbind.data.frame(c("12/19/20 Influent", "12/21/20 Influent", "12/23/20 Influent", "12/20/20 Effluent", "12/22/20 Effluent", "12/24/20 Effluent"), temp)
+colnames(abund_table_v2) <- c("sample", "crAssphage", "adenovirus", "polyomavirus", "HM1", "crAss_primers", "JC_poly", "BK_poly")
+### convert from uL to mL
+abund_table_v2[,2:8] <- 1000*abund_table_v2[,2:8]
+abund_table[,2:8] <- 1000*abund_table[,2:8]
+
+abund_table_v2[,2:8] <- log10(abund_table_v2[,2:8])
+write.table(abund_table_v2, "figures/virus_abundance_log10_contigs.txt", sep = "\t", col.names = TRUE, row.names = FALSE)
+```
+
+```{r}
+db_abund_table <- cbind.data.frame(samples, 0, 0, 0, 0, 0)
+colnames(db_abund_table) <- c("sample", "crAssphage", "HM1", "crAss_primer", "JC_poly", "BK_poly")
+
+abund_calc <- function(target_list, abundance_list) {
+  temp <- subset(abundance_list, ID %in% target_list)
+  return(sum(temp$concentration))
+}
+
+crAss_primers_list <- c("MW063138.1", "MW067003.1", "MW067002.1", "MW067001.1", "MW067000.1", "MT006214.1", "MK415410.1", "MK415408.1", "MK415404.1", "MK415403.1", "MK238400.1", "NC_024711.1", "BK049789.1", "MZ130481.1", "MK415399.1")
+
+JC_poly_list <- c("NC_001699.1")
+
+BK_poly_list <- c("NC_001538.1")
+
+for (i in samples) {
+  filename <- "Results/sample/crAssphage_results.txt"
+  filename <- gsub("sample", i, filename)
+  abundance <- data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  colnames(abundance) <- c("ID", "concentration", "std_dev")
+  
+  db_abund_table$crAssphage[db_abund_table$sample == i] <- sum(abundance$concentration)
+  db_abund_table$crAss_primer[db_abund_table$sample == i] <- abund_calc(crAss_primers_list, abundance)
+  
+  filename <- "Results/sample/virus_pathogens_results.txt"
+  filename <- gsub("sample", i, filename)
+  if (file.size(filename) == 55) {
+    db_abund_table$JC_poly[db_abund_table$sample == i] <- NA
+    db_abund_table$BK_poly[db_abund_table$sample == i] <- NA
+  } else {
+    temp <- data.frame(read.table(filename, header = FALSE, sep = "\t", stringsAsFactors = FALSE))
+    colnames(temp) <- c("ID", "concentration", "std_dev")
+    temp$concentration <- as.numeric(temp$concentration)
+    db_abund_table$JC_poly[db_abund_table$sample == i] <- abund_calc(JC_poly_list, temp)
+    db_abund_table$BK_poly[db_abund_table$sample == i] <- abund_calc(BK_poly_list, temp)
+  }
+  
+  filename <- "Results/sample/HM1_results.txt"
+  filename <- gsub("sample", i, filename)
+  abundance <- data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  colnames(abundance) <- c("ID", "concentration", "std_dev")
+  
+  db_abund_table$HM1[db_abund_table$sample == i] <- sum(abundance$concentration)
+}
+
+### remove the recovery term to the calculation (multiply by recovery)
+temp <- read.table("Sample_Characteristics/2021_WW_extraction_info.txt", sep = "\t", header = TRUE)
+db_abund_table[,2:6] <- apply(db_abund_table[,2:6], 2, FUN = function(x) {temp$recovery*x})
+temp <- rbind.data.frame(db_abund_table[1, 2:6], apply(db_abund_table[2:4, 2:6], 2, mean), db_abund_table[5, 2:6], db_abund_table[6, 2:6], apply(db_abund_table[7:9, 2:6], 2, mean), db_abund_table[10, 2:6])
+
+db_abund_table_v2 <- cbind.data.frame(c("12/19/20 Influent", "12/21/20 Influent", "12/23/20 Influent", "12/20/20 Effluent", "12/22/20 Effluent", "12/24/20 Effluent"), temp)
+colnames(db_abund_table_v2) <- c("sample", "crAssphage", "HM1", "crAss_primers", "JC_poly", "BK_poly")
+### covert from uL to mL
+db_abund_table_v2[,2:6] <- 1000*db_abund_table_v2[,2:6]
+db_abund_table[,2:6] <- 1000*db_abund_table[,2:6]
+
+db_abund_table_v2[,2:6] <- log10(db_abund_table_v2[,2:6])
+write.table(db_abund_table_v2, "figures/virus_abundance_log10_db.txt", sep = "\t", col.names = TRUE, row.names = FALSE)
+```
+
+Compare HM1 measurements from ddPCR, contig-based, and read-based
+```{r}
+HM1_overview <- data.frame(samples, c(917, 862, 876, 1110, 723, 1340, 1300, 1280, 1070, 1580), abund_table$HM1, db_abund_table$HM1)
+colnames(HM1_overview) <- c("sample", "ddPCR", "contig_based", "read_based")
+temp <- read.table("Sample_Characteristics/2021_WW_extraction_info.txt", sep = "\t", header = TRUE)
+#HM1_overview$contig_based <- HM1_overview$contig_based*temp$recovery
+#HM1_overview$read_based <- HM1_overview$read_based*temp$recovery
+HM1_overview[,2:4] <- log10(HM1_overview[,2:4])
+
+ddPCR_v_reads <- t.test(HM1_overview$ddPCR, HM1_overview$read_based, alternative = "two.sided", paired = TRUE, conf.level = 0.95, na.action = na.omit)
+#ddPCR_v_contigs <- t.test(HM1_overview$ddPCR, HM1_overview$contig_based, alternative = "two.sided", paired = TRUE, conf.level = 0.95, na.action = na.omit)
+#reads_v_contigs <- t.test(HM1_overview$read_based, HM1_overview$contig_based, alternative = "two.sided", paired = TRUE, conf.level = 0.95, na.action = na.omit)
+
+ddPCR_v_reads
+#ddPCR_v_contigs
+#reads_v_contigs
+
+### are technical replicates different from each other?
+t.test(10^(HM1_overview$read_based[2:4]), alternative = "two.sided", paired = FALSE, conf.level = 0.95)
+t.test(10^(HM1_overview$read_based[7:9]), alternative = "two.sided", paired = FALSE, conf.level = 0.95)
+
+mean(HM1_overview$ddPCR[!is.na(HM1_overview$read_based)]-HM1_overview$read_based[!is.na(HM1_overview$read_based)])
+mean(HM1_overview$ddPCR)
+HM1_INF <- subset(HM1_overview, sample %in% c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1"))
+mean(HM1_INF$ddPCR) - mean(HM1_INF$read_based)
+#HM1_INF$ddPCR <- 10^(HM1_INF$ddPCR)
+#HM1_INF$read_based <- 10^(HM1_INF$read_based)
+(mean(HM1_INF$ddPCR) - mean(HM1_INF$read_based))/mean(HM1_INF$ddPCR)
+
+HM1_EFF <- subset(HM1_overview, sample %in% c("EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1"))
+mean(HM1_EFF$ddPCR) - mean(HM1_EFF$read_based[!is.na(HM1_EFF$read_based)])
+#HM1_EFF$ddPCR <- 10^(HM1_EFF$ddPCR)
+#HM1_EFF$read_based <- 10^(HM1_EFF$read_based)
+(mean(HM1_EFF$ddPCR) - mean(HM1_EFF$read_based[!is.na(HM1_EFF$read_based)]))/mean(HM1_EFF$ddPCR)
+
+INF_ddPCR_v_reads <- t.test(HM1_INF$ddPCR, HM1_INF$read_based, alternative = "two.sided", paired = TRUE, conf.level = 0.95, na.action = na.omit)
+INF_ddPCR_v_reads
+EFF_ddPCR_v_reads <- t.test(HM1_EFF$ddPCR, HM1_EFF$read_based, alternative = "two.sided", paired = TRUE, conf.level = 0.95, na.action = na.omit)
+EFF_ddPCR_v_reads
+```
+
+```{r}
+db_abund_table_v2$crAss_primers <- 10^db_abund_table_v2$crAss_primers
+db_abund_table_v2$crAssphage <- 10^db_abund_table_v2$crAssphage
+
+mean(db_abund_table_v2$crAssphage[db_abund_table_v2$sample %like% "Influent"])
+sd(db_abund_table_v2$crAssphage[db_abund_table_v2$sample %like% "Influent"])
+mean(db_abund_table_v2$crAssphage[db_abund_table_v2$sample %like% "Effluent"])
+sd(db_abund_table_v2$crAssphage[db_abund_table_v2$sample %like% "Effluent"])
+
+db_abund_table_v2$crAss_diff <- (db_abund_table_v2$crAssphage - db_abund_table_v2$crAss_primers)/db_abund_table_v2$crAssphage
+
+abund_table_v2$crAss_diff <- (abund_table_v2$crAssphage - abund_table_v2$crAss_primers)/abund_table_v2$crAssphage
+```
+
+
+```{r}
+crAss_primers <- t.test(1000*db_abund_table$crAssphage, 1000*db_abund_table$crAss_primer, alternative = "two.sided", paired = TRUE, conf.level = 0.95, na.action = na.omit)
+crAss_primers
+crAss_primers_2 <- t.test(abund_table_v2$crAssphage, abund_table_v2$crAss_primers, alternative = "two.sided", paired = TRUE, conf.level = 0.95, na.action = na.omit)
+crAss_primers_2
+crAss_reads_v_contigs <- t.test(abund_table_v2$crAssphage, db_abund_table_v2$crAssphage, alternative = "two.sided", paired = TRUE, conf.level = 0.95, na.action = na.omit)
+crAss_reads_v_contigs
+crAss_prim_reads_v_contigs <- t.test(abund_table_v2$crAss_primers, db_abund_table_v2$crAss_primers, alternative = "two.sided", paired = TRUE, conf.level = 0.95, na.action = na.omit)
+crAss_prim_reads_v_contigs
+```
+
+```{r}
+db_abund_table_v2$JC_poly <- 10^db_abund_table_v2$JC_poly
+mean(db_abund_table_v2$JC_poly[db_abund_table_v2$sample %like% "Influent"])
+
+db_abund_table_v2$BK_poly <- 10^db_abund_table_v2$BK_poly
+mean(db_abund_table_v2$BK_poly[db_abund_table_v2$sample %like% "Influent"])
+```
+
+```{r}
+for (i in samples) {
+  filename <- "Results/sample/crAssphage_quant_correct.txt"
+  filename <- gsub("sample", i, filename)
+  temp <- read.table(filename, sep = "\t", header = TRUE)
+  
+  if (i == "INF_1_1") {
+    crAss_quant_correct <- temp
+  } else {
+    crAss_quant_correct <- rbind.data.frame(crAss_quant_correct, temp)
+  }
+}
+
+nrow(subset(crAss_quant_correct, frac_corrected > 0))/nrow(crAss_quant_correct)
+```
+
+
+### Evaluate the percent of false positives from read mapping to NCBI genomes, NCBI genes, and VirSorter databases
+```{r}
+false_pos <- data.frame("sample" = samples, "NCBI" = rep(0,10), "NCBI_genes" = rep(0,10), "VirSorter" = rep(0,10))
+
+for (i in samples) {
+  filename <- "Mapping/sample/NCBI_viral_quant_correct.txt"
+  filename <- gsub("sample", i, filename)
+  NCBI_results <- read.table(filename, sep = "\t", header = TRUE)
+  
+  temp <- subset(NCBI_results, RMSE > RMSE_limit)
+  false_pos$NCBI[false_pos$sample == i] <- sum(temp$initial_total_avg_depth)/sum(NCBI_results$initial_total_avg_depth)
+  
+  filename <- "Mapping/sample/NCBI_viral_genes_quant_correct.txt"
+  filename <- gsub("sample", i, filename)
+  NCBI_genes_results <- read.table(filename, sep = "\t", header = TRUE)
+  
+  temp <- subset(NCBI_genes_results, RMSE > RMSE_limit)
+  false_pos$NCBI_genes[false_pos$sample == i] <- sum(temp$initial_total_avg_depth)/sum(NCBI_genes_results$initial_total_avg_depth)
+  
+  filename <- "Mapping/sample/VirSorter_curated_db_quant_correct.txt"
+  filename <- gsub("sample", i, filename)
+  VirSorter_results <- read.table(filename, sep = "\t", header = TRUE)
+  
+  temp <- subset(VirSorter_results, RMSE > RMSE_limit)
+  false_pos$VirSorter[false_pos$sample == i] <- sum(temp$initial_total_avg_depth)/sum(VirSorter_results$initial_total_avg_depth)
+}
+
+mean(false_pos$NCBI)
+mean(false_pos$NCBI_genes)
+mean(false_pos$VirSorter)
+```
+
+#### Check total virus concentrations after viral contig quant correction
+```{r}
+samples <- c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1", "EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1")
+
+total_abund <- data.frame("sample" = samples, "matrix" = c(rep("Influent", 5), rep("Effluent", 5)), "total_conc" = 0)
+
+for (i in 1:length(samples)) {
+  filename <- "Results/sample/viral_bins_derep_results.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  temp <- cbind.data.frame("ID" = temp$ID, temp[,3:4])
+  temp <- unique.data.frame(temp)
+  
+  total_abund$total_conc[i] <- 1000*sum(temp$concentration..gc.µL.)
+  
+  temp_clusters <- aggregate(temp[c("concentration..gc.µL.")], temp[c("ID")], FUN = function(x) {sum(x)})
+  colnames(temp_clusters) <- c("ID", samples[[i]])
+  
+  if (i == 1) {
+    viral_contig_cluster <- temp_clusters
+  } else {
+    viral_contig_cluster <- merge.data.frame(viral_contig_cluster, temp_clusters, by = "ID", all = TRUE)
+  }
+}
+
+temp <- read.table("Sample_Characteristics/2021_WW_extraction_info.txt", sep = "\t", header = TRUE)
+total_abund$total_conc <- total_abund$total_conc*temp$recovery
+```
+
+Total virus concentration analysis
+```{r}
+total_abund_exp_reps <- rbind.data.frame(total_abund[1,], c("INF_2_all", "Influent", mean(total_abund$total_conc[2:4])), total_abund[5:6,], c("EFF_2_all", "Effluent", mean(total_abund$total_conc[7:9])), total_abund[10,])
+total_abund_exp_reps$total_conc <- as.numeric(total_abund_exp_reps$total_conc)
+
+t.test(total_abund_exp_reps$total_conc[total_abund_exp_reps$matrix == "Influent"], total_abund_exp_reps$total_conc[total_abund_exp_reps$matrix == "Effluent"], paired = FALSE)
+
+avgs <- data.frame("matrix" = c("Influent", "Effluent"), "total_conc" = 0, "sd" = 0)
+avgs$total_conc[avgs$matrix == "Influent"] <- log10(mean(total_abund_exp_reps$total_conc[total_abund_exp_reps$matrix == "Influent"]))
+avgs$sd[avgs$matrix == "Influent"] <- log10(sd(total_abund_exp_reps$total_conc[total_abund_exp_reps$matrix == "Influent"]))
+avgs$total_conc[avgs$matrix == "Effluent"] <- log10(mean(total_abund_exp_reps$total_conc[total_abund_exp_reps$matrix == "Effluent"]))
+avgs$sd[avgs$matrix == "Effluent"] <- log10(sd(total_abund_exp_reps$total_conc[total_abund_exp_reps$matrix == "Effluent"]))
+
+total_abund_exp_reps$total_conc <- log10(total_abund_exp_reps$total_conc)
+
+total_abund_exp_reps$matrix <- factor(total_abund_exp_reps$matrix, levels = c("Influent", "Effluent"))
+avgs$matrix <- factor(avgs$matrix, levels = c("Influent", "Effluent"))
+
+total_virus <- ggplot(total_abund_exp_reps, aes(y = total_conc, x = matrix)) + geom_point(shape = 1) +
+  geom_point(data=avgs, aes(x=matrix, y=total_conc), size = 10, shape = 95) +
+  pretty_plot + 
+  xlab("Wastewater") +
+  ylab(expression(Concentration~(log[10]~gc/mL))) 
+
+ggsave("figures/Figure_S9.png", plot = total_virus, width = 4, height = 5, dpi = 400, units = "in", limitsize = TRUE)
+
+cairo_pdf("figures/Figure_S9.pdf", width = 4, height = 5)
+total_virus
+dev.off()
+
+total_virus
+```
+
+Which viral populations are present in all samples?
+```{r}
+all_samples_viruses <- subset(viral_contig_cluster, !(is.na(INF_1_1)) & !(is.na(INF_2_1)) & !(is.na(INF_2_2)) & !(is.na(INF_2_3)) & !(is.na(INF_3_1)) & !(is.na(EFF_1_1)) & !(is.na(EFF_2_1)) & !(is.na(EFF_2_2)) & !(is.na(EFF_2_3)) & !(is.na(EFF_3_1)))
+```
+
+Alpha diversity of the samples
+```{r}
+alpha_diversity <- data.frame("sample" = samples, "H" = rep(0, 10))
+
+temp <- data.frame(t(viral_contig_cluster[,2:11]))
+temp[is.na(temp)] <- 0
+
+alpha_diversity$H <- diversity(temp)
+
+### influent alpha diversity
+mean(alpha_diversity$H[alpha_diversity$sample %in% c("INF_1_1", "INF_3_1")], mean(alpha_diversity$H[alpha_diversity$sample %in% c("INF_2_1", "INF_2_2", "INF_2_3")]))
+temp <- c(alpha_diversity$H[alpha_diversity$sample %in% c("INF_1_1", "INF_3_1")], mean(alpha_diversity$H[alpha_diversity$sample %in% c("INF_2_1", "INF_2_2", "INF_2_3")]))
+sd(temp)
+### effluent alpha diversity
+mean(alpha_diversity$H[alpha_diversity$sample %in% c("EFF_1_1", "EFF_3_1")], mean(alpha_diversity$H[alpha_diversity$sample %in% c("EFF_2_1", "EFF_2_2", "EFF_2_3")]))
+temp <- c(alpha_diversity$H[alpha_diversity$sample %in% c("EFF_1_1", "EFF_3_1")], mean(alpha_diversity$H[alpha_diversity$sample %in% c("EFF_2_1", "EFF_2_2", "EFF_2_3")]))
+sd(temp)
+```
+
+### Viral Pathogen analysis
+### Assess the outputs without limitations analysis
+```{r}
+##### Predicted Concentration (gene copies/µL DNA extract) Calculator ########################################3
+prediction <- function (mapping, DNA_input, DNA_conc, target_type) {
+  pred_conc_calc <- function(gc, mass, conc) {
+    predicted <- gc*conc/mass
+    # (gene copy standard_x)/(ng DNA library insert) = gene copies standard_x/ng total DNA*(ng DNA/µL DNA extract)
+    return(predicted)
+  }
+  
+  if (target_type == "database") {
+    result = data.frame(mapping$ID)
+    result$predicted_conc <- pred_conc_calc(mapping$gene_copies, DNA_input, DNA_conc)
+    colnames(result) <- c("ID", "predicted_conc")
+  } else {
+    result = cbind.data.frame("ID" = mapping$ID, "contig_ID" = mapping$contig_ID)
+    result$predicted_conc <- pred_conc_calc(mapping$gene_copies, DNA_input, DNA_conc)
+    colnames(result) <- c("ID", "contig_ID", "predicted_conc")
+  }
+  
+  return(result)
+}
+
+##### Calculate concentrations in original sample ################################
+in_original <- function(concentration, conc_factor) {
+  concentration$`concentration (gc/µL)` <- concentration$`concentration (gc/µL)`/conc_factor
+  concentration$`std deviation (gc/µL)` <- concentration$`std deviation (gc/µL)`/conc_factor
+  return(concentration)
+}
+
+quant_rel <- readRDS("Regressions/quantification/rel_to_abs")
+
+sample_info <- data.frame(read.table("Spike-ins/2021_WW_sample_info.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+char <- data.frame(read.table("Sample_Characteristics/2021_WW_extraction_info.txt", header = TRUE, sep = "\t"))
+```
+
+Cycle through for each sample
+```{r}
+samples <- c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1", "EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1")
+
+for (i in samples) {
+  filename1 <- "Results/sample/virus_pathogens_mapping_analysis.txt"
+  filename1 <- gsub("sample", i, filename1)
+  mapping <- data.frame(read.table(filename1, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  
+  DNA_input = sample_info$lib_mass[sample_info$Sample == i]
+  DNA_conc = sample_info$DNA_conc[sample_info$Sample == i]
+  CF = char$CF[char$sample == i]
+  
+  # Convert targets' relative abundances to units of (gene copies/ng DNA)
+  results <- prediction(mapping, DNA_input, DNA_conc, "database")
+  
+  # Convert relative abundance to absolute abundance
+  pred <- predict(quant_rel, newdata = results, se.fit = TRUE)
+
+  results <- cbind.data.frame(results$ID, 10^(pred[[1]]), 10^(pred[[2]]*sqrt(pred[[3]]+1)))
+  colnames(results) <- c("ID", "concentration (gc/µL)",  "std deviation (gc/µL)")
+
+  # Convert to concentrations in wastewater (gc/µL)
+  results <- in_original(results, CF)
+  
+  temp <- cbind.data.frame("ID" = mapping$ID, "E_rel" = mapping$E_rel, "E_detect" = mapping$E_detect, "detection status" = mapping$detection_status)
+  results <- merge.data.frame(results, temp, by = "ID")
+
+  filename <- "Results/sample/virus_pathogens_results_nolimits.txt"
+  filename <- gsub("sample", i, filename)
+  write.table(results, filename, sep = "\t", col.names = TRUE, row.names = FALSE)
+  
+  df_name <- "sample_results"
+  df_name <- gsub("sample", i, df_name)
+  assign(df_name, results)
+}
+```
+
+Merge the separate results into a single large dataframe
+```{r}
+samples <- c("INF_1_1", "INF_2_1", "INF_3_1", "EFF_1_1", "EFF_2_2", "EFF_3_1")
+full_names <- c("12/19/20 Influent", "12/21/20 Influent", "12/23/20 Influent", "12/20/20 Effluent", "12/22/20 Effluent", "12/24/20 Effluent")
+results <- list(INF_1_1_results, INF_2_1_results, INF_3_1_results, EFF_1_1_results, EFF_2_2_results, EFF_3_1_results)
+
+for (i in 1:length(samples)) {
+  if (i == 1) {
+    summary <- cbind.data.frame(results[[i]][,1:2], results[[i]][4:6])
+    summary$`concentration (gc/µL)` <- 1000*summary$`concentration (gc/µL)`
+    name_conc <- "sample Concentration (gc/mL)"
+    name_conc <- gsub("sample", full_names[[i]], name_conc)
+    name_Er <- "sample E_rel"
+    name_Er <- gsub("sample", full_names[[i]], name_Er)
+    name_Ed <- "sample E_detect"
+    name_Ed <- gsub("sample", full_names[[i]], name_Ed)
+    name_det <- "sample Detection Status"
+    name_det <- gsub("sample", full_names[[i]], name_det)
+    colnames(summary) <- c("ID", name_conc, name_Er, name_Ed, name_det)
+  } else {
+    temp <- cbind.data.frame(results[[i]][,1:2], results[[i]][4:6])
+    temp$`concentration (gc/µL)` <- 1000*temp$`concentration (gc/µL)`
+    name_conc <- "sample Concentration (gc/mL)"
+    name_conc <- gsub("sample", full_names[[i]], name_conc)
+    name_Er <- "sample E_rel"
+    name_Er <- gsub("sample", full_names[[i]], name_Er)
+    name_Ed <- "sample E_detect"
+    name_Ed <- gsub("sample", full_names[[i]], name_Ed)
+    name_det <- "sample Detection Status"
+    name_det <- gsub("sample", full_names[[i]], name_det)
+    colnames(temp) <- c("ID", name_conc, name_Er, name_Ed, name_det)
+    summary <- merge.data.frame(summary, temp, by = "ID", all = TRUE)
+  }
+}
+```
+
+Add in the full names of the ID's
+```{r}
+ID_names <- data.frame(read.table("Map_Indexes/virus_pathogens_reps_list.txt", header = FALSE, sep = "\t"))
+
+NCBI <- subset(ID_names, !(V1 %like% "gb:"))
+NCBI <- separate(NCBI, V1, into = c("ID", "Virus"), sep = "\\s", extra = "merge")
+
+ViPR <- subset(ID_names, V1 %like% "gb:")
+ViPR_2 <- separate(ViPR, V1, into = c("ID", "Virus"), sep = "\\|", extra = "merge")
+ViPR <- separate(ViPR, V1, into = c("ID", "garbage"), sep = "\\s", extra = "merge")
+ViPR <- cbind.data.frame(ViPR, ViPR_2)
+ViPR <- cbind.data.frame("ID" = ViPR[,1], "Virus" = ViPR[,4])
+
+ID_names <- rbind.data.frame(NCBI, ViPR)
+
+summary <- merge.data.frame(ID_names, summary, by = "ID")
+```
+
+```{r}
+write.table(summary, "Results/virus_pathogens_reps_summary_nolimits.txt", sep = "\t", col.names = TRUE, row.names = FALSE)
+```
+
+### manipulated the data manually in excel
+```{r}
+summary_melt <- data.frame(read.table("Results_old/virus_pathogens_rep_summary.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+summary_melt$virus_cat <- factor(summary_melt$virus_cat, levels = c("Adenovirus", "Herpesvirus", "Bocavirus", "Papillomavirus", "Polyomavirus"))
+summary_melt$matrix <- "Influent"
+summary_melt$matrix[summary_melt$sample %in% c("EFF_1_1", "EFF_2_2", "EFF_3_1")] <- "Effluent"
+summary_melt$matrix <- factor(summary_melt$matrix, levels = c("Influent", "Effluent"))
+
+### Bocavirus is the only ssDNA virus -- multiply by 2
+summary_melt$concentration[summary_melt$virus_cat == "Bocavirus"] <- 2*summary_melt$concentration[summary_melt$virus_cat == "Bocavirus"]
+
+ggplot(summary_melt, aes(x=virus_cat, y=concentration)) +
+  geom_boxplot(outlier.shape = NA) + geom_jitter(position=position_jitter(0.2), shape = 1) +
+  pretty_plot + facet_grid(matrix~.) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  xlab("Type of Virus Pathogen") + ylab("Concentration (copies/mL wastewater)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+```
+
+```{r}
+ggplot(summary_melt, aes(x=virus_cat, y=concentration, color = detection_status)) +
+  geom_boxplot(color = "black", outlier.shape = NA) + geom_jitter(position=position_jitter(0.2)) +
+  scale_colour_manual(values = c("red", "grey20")) +
+  pretty_plot + facet_grid(matrix~.) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  xlab("Type of Virus Pathogen") + ylab("Concentration (copies/mL wastewater)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+vp <- ggplot(summary_melt, aes(x=virus_cat, y=concentration, color = detection_status)) +
+  geom_boxplot(color = "black", outlier.shape = NA) + geom_jitter(position=position_jitter(0.2)) +
+  scale_colour_manual(values = c("red", "grey20")) +
+  pretty_plot + facet_grid(matrix~.) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  xlab("Type of Virus Pathogen") + ylab("Concentration (copies/mL wastewater)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  theme(legend.position = "bottom")
+
+cairo_pdf("figures/Figure_5.pdf", width = 10, height = 8)
+vp
+dev.off()
+
+vp
+```
+
+```{r}
+clusters <- data.frame(read.table("Map_Indexes/virus_pathogens_clusters.tsv", header = FALSE, sep = "\t"))
+colnames(clusters) <- c("ID", "Viruses in Cluster")
+clusters <- merge.data.frame(ID_names, clusters, by = "ID")
+clusters <- cbind.data.frame("Representative" = clusters$Virus, "NCBI Accession" = clusters$ID, "Viruses in Cluster" = clusters$`Viruses in Cluster`)
+clusters$`NCBI Accession` <- gsub("gb:", "", clusters$`NCBI Accession`)
+clusters <- separate(clusters, `NCBI Accession`, into = c("NCBI Accession", "extra"), sep = "\\|")
+clusters <- cbind.data.frame(clusters[,1:2], "Viruses in Cluster" = clusters$`Viruses in Cluster`)
+
+write.table(clusters, file = "Results/Table_S6_pathogenclusters.txt", quote = FALSE, sep = "\t", row.names = FALSE, col.names = TRUE)
+```
+
+How many targets are close to being detected? (define close as within 10% of threshold)
+```{r}
+EFF_1_1_results$E_detect_close <- EFF_1_1_results$E_detect - 0.1*EFF_1_1_results$E_detect
+EFF_1_1_results$almost_detected_status <- EFF_1_1_results$`detection status`
+EFF_1_1_results$almost_detected_status[EFF_1_1_results$almost_detected_status == "not_detected" & EFF_1_1_results$E_rel > EFF_1_1_results$E_detect_close] <- "almost_detected"
+nrow(subset(EFF_1_1_results, almost_detected_status == "almost_detected"))
+print(subset(EFF_1_1_results, almost_detected_status == "almost_detected")$ID)
+```
+```{r}
+EFF_2_2_results$E_detect_close <- EFF_2_2_results$E_detect - 0.1*EFF_2_2_results$E_detect
+EFF_2_2_results$almost_detected_status <- EFF_2_2_results$`detection status`
+EFF_2_2_results$almost_detected_status[EFF_2_2_results$almost_detected_status == "not_detected" & EFF_2_2_results$E_rel > EFF_2_2_results$E_detect_close] <- "almost_detected"
+nrow(subset(EFF_2_2_results, almost_detected_status == "almost_detected"))
+print(subset(EFF_2_2_results, almost_detected_status == "almost_detected")$ID)
+```
+```{r}
+EFF_3_1_results$E_detect_close <- EFF_3_1_results$E_detect - 0.1*EFF_3_1_results$E_detect
+EFF_3_1_results$almost_detected_status <- EFF_3_1_results$`detection status`
+EFF_3_1_results$almost_detected_status[EFF_3_1_results$almost_detected_status == "not_detected" & EFF_3_1_results$E_rel > EFF_3_1_results$E_detect_close] <- "almost_detected"
+nrow(subset(EFF_3_1_results, almost_detected_status == "almost_detected"))
+print(subset(EFF_3_1_results, almost_detected_status == "almost_detected")$ID)
+```
+```{r}
+INF_1_1_results$E_detect_close <- INF_1_1_results$E_detect - 0.1*INF_1_1_results$E_detect
+INF_1_1_results$almost_detected_status <- INF_1_1_results$`detection status`
+INF_1_1_results$almost_detected_status[INF_1_1_results$almost_detected_status == "not_detected" & INF_1_1_results$E_rel > INF_1_1_results$E_detect_close] <- "almost_detected"
+nrow(subset(INF_1_1_results, almost_detected_status == "almost_detected"))
+print(subset(INF_1_1_results, almost_detected_status == "almost_detected")$ID)
+```
+```{r}
+INF_2_1_results$E_detect_close <- INF_2_1_results$E_detect - 0.1*INF_2_1_results$E_detect
+INF_2_1_results$almost_detected_status <- INF_2_1_results$`detection status`
+INF_2_1_results$almost_detected_status[INF_2_1_results$almost_detected_status == "not_detected" & INF_2_1_results$E_rel > INF_2_1_results$E_detect_close] <- "almost_detected"
+nrow(subset(INF_2_1_results, almost_detected_status == "almost_detected"))
+print(subset(INF_2_1_results, almost_detected_status == "almost_detected")$ID)
+```
+```{r}
+INF_3_1_results$E_detect_close <- INF_3_1_results$E_detect - 0.1*INF_3_1_results$E_detect
+INF_3_1_results$almost_detected_status <- INF_3_1_results$`detection status`
+INF_3_1_results$almost_detected_status[INF_3_1_results$almost_detected_status == "not_detected" & INF_3_1_results$E_rel > INF_3_1_results$E_detect_close] <- "almost_detected"
+nrow(subset(INF_3_1_results, almost_detected_status == "almost_detected"))
+print(subset(INF_3_1_results, almost_detected_status == "almost_detected")$ID)
+```
+```{r}
+almost_targets <- rbind.data.frame(EFF_1_1_results, EFF_2_2_results, EFF_3_1_results, INF_1_1_results, INF_2_1_results, INF_3_1_results)
+almost_targets <- subset(almost_targets, almost_detected_status != "detected")
+nrow(almost_targets)
+almost_targets <- subset(almost_targets, almost_detected_status == "almost_detected")
+nrow(almost_targets)
+almost_targets <- merge.data.frame(ID_names, almost_targets, by = "ID")
+print(unique(almost_targets$Virus))
+```
+```{r}
+targets <- rbind.data.frame(EFF_1_1_results, EFF_2_2_results, EFF_3_1_results, INF_1_1_results, INF_2_1_results, INF_3_1_results)
+targets <- subset(targets, almost_detected_status == "not_detected")
+targets$E_ratio <- 1-targets$E_rel/targets$E_detect
+```
+
+
+#### Compare standards reference-based and contig-based quantification for discussion section
+```{r}
+sample_info <- as.data.frame(read.table(file = "Spike-ins/2021_WW_sample_info.txt", sep = '\t', header = TRUE, stringsAsFactors = FALSE))
+
+spike_conc <- as.data.frame(read.table("Spike-ins/2021_WW_stds_ddPCR_conc.txt", header = TRUE, sep = '\t', stringsAsFactors = FALSE))
+
+samples <- data.frame(c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1", "EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1"))
+
+std_mapping_list <- c("Mapping/INF_1_1/standards_0/standards_mapping_analysis.txt", "Mapping/INF_2_1/standards_0/standards_mapping_analysis.txt", "Mapping/INF_2_2/standards_0/standards_mapping_analysis.txt", "Mapping/INF_2_3/standards_0/standards_mapping_analysis.txt", "Mapping/INF_3_1/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_1_1/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_2_1/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_2_2/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_2_3/standards_0/standards_mapping_analysis.txt", "Mapping/EFF_3_1/standards_0/standards_mapping_analysis.txt")
+
+prediction <- function (mapping, DNA_input, DNA_conc) {
+  pred_conc_calc <- function(copies, mass, conc) {
+    predicted <- copies*conc/mass
+    # (gene copy standard_x)/(ng DNA library insert) = gene copies standard_x/ng total DNA*(ng DNA/µL DNA extract)
+    return(predicted)
+  }
+  
+  result = data.frame(mapping$ID)
+  result$predicted_conc <- pred_conc_calc(as.numeric(mapping$gene_copies), DNA_input, DNA_conc)
+  colnames(result) <- c("ID", "predicted_conc")
+  
+  return(result)
+}
+
+for (i in 1:nrow(samples)) {
+  mapping <- read.table(std_mapping_list[i], header = TRUE, sep = "\t")
+  temp <- samples[i,1]
+  ddPCR_temp <- data.frame("ID" = spike_conc$ID, "expected_conc" = as.numeric(spike_conc[,temp]))
+  ddPCR_temp$expected_conc <- ddPCR_temp$expected_conc
+  mapping <- merge.data.frame(mapping, ddPCR_temp, by = "ID", all.y = TRUE)
+  temp <- prediction(mapping, sample_info$lib_mass, sample_info$DNA_conc)
+  mapping <- merge.data.frame(mapping, temp, by = "ID")
+  mapping$sample <- samples[i,1]
+  mapping$filter <- "NO"
+  mapping$nuc_acid <- "dsDNA"
+  mapping$nuc_acid[mapping$ID %in% c("NC_000936.1_S3", "NC_027637.1_S2", "NC_039057.1_S1", "NC_025708.1_S1", "NC_010429.1_S4")] <- "ssDNA"
+  
+  if (i == 1) {
+    stds_no_filter <- mapping
+  } 
+  else {
+    stds_no_filter <- rbind.data.frame(stds_no_filter, mapping)
+  }
+}
+
+stds_no_filter$E_rel[is.na(stds_no_filter$E_rel)] <- 0
+stds_no_filter$predicted_conc[is.na(stds_no_filter$predicted_conc)] <- 0
+```
+
+# Filter the predicted_conc by E_detect cut-offs
+```{r}
+STD_MIX <- read.table("Spike-ins/STD_MIXES.txt", header = TRUE, sep = "\t")
+STD_MIX <- cbind.data.frame("ID" = STD_MIX$ID, "length" = STD_MIX$length)
+
+stds_no_filter <- merge.data.frame(stds_no_filter, STD_MIX, by = "ID")
+
+stds_filter <- stds_no_filter
+
+E_detect <- readRDS("Regressions/Langenfeld_2024_E_detect")
+
+stds_filter$E_detect <- predict(E_detect, newdata = stds_filter)
+
+stds_filter <- subset(stds_filter, E_rel >= E_detect)
+
+stds_filter$filter <- "YES"
+
+rel_to_abs <- readRDS("Regressions/quantification/rel_to_abs")
+
+stds_filter$concentration <- predict(rel_to_abs, newdata = stds_filter)
+
+stds_db <- cbind.data.frame("ID" = stds_filter$ID, "sample" = stds_filter$sample, "nuc_acid" = stds_filter$nuc_acid, "db_conc" = stds_filter$concentration)
+```
+
+```{r}
+R <- read.table("Sample_Characteristics/2021_WW_extraction_info.txt", sep = "\t", header = TRUE)
+
+for (i in 1:nrow(samples)) {
+  filename <- "Results/sample/standards_contigs_results.txt"
+  filename <- gsub("sample", samples[i,1], filename)
+  temp <- read.table(filename, sep = "\t", header = TRUE)
+  
+  temp <- cbind.data.frame("ID" = temp$ID, "sample" = samples[i,1], "contig_conc" = temp$concentration..gc.µL.)
+  temp$contig_conc <- 1000*temp$contig_conc*R$recovery[R$sample == samples[i,1]]
+  
+  if (i == 1) {
+    stds_contig <- temp
+  } else {
+    stds_contig <- rbind.data.frame(stds_contig, temp)
+  }
+}
+
+stds_contig <- unique(stds_contig)
+```
+
+```{r}
+stds_comparison <- merge.data.frame(stds_db, stds_contig, by = c("ID", "sample"))
+stds_comparison$contig_conc <- log10(stds_comparison$contig_conc)
+
+stds_comparison$diff <- (stds_comparison$db_conc - stds_comparison$contig_conc)/stds_comparison$db_conc
+
+t.test(stds_comparison$db_conc, stds_comparison$contig_conc, alternative = "two.sided", paired = TRUE, conf.level = 0.95, na.action = na.omit)
+
+mean(abs(stds_comparison$diff))
+l.model <- lm(abs(diff) ~ 1, stds_comparison)
+confint(l.model, level=0.95)
+```
+

@@ -1,0 +1,1530 @@
+---
+title: "Read Depth Variability Analysis and Threshold Analysis"
+output: html_notebook
+---
+
+Purpose: Develop the read depth variability threshold and figures related to mapping reads to standard contigs
+
+Load required libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+library(MASS)
+library(scales)
+library(gridExtra)
+library(cowplot)
+library(ggpmisc)
+library(pROC)
+library(ggpubr)
+library(ggbeeswarm)
+library(cutpointr)
+library(data.table)
+
+pretty_plot <- theme_classic() + theme(
+  #text = element_text(family = "Lucinda Sans", color = "black"),
+  plot.margin = margin(1,1,1,1, "cm"),
+  axis.line.x.bottom = element_line(color = "black", size = 0.5),
+  axis.line.y.left = element_line(color = "black", size = 0.5),
+  panel.border = element_rect(colour="black", fill = NA, size = 0.5),
+  strip.background = element_blank(),
+  strip.text = element_text(size = 12),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  plot.title = element_text(size = 15),
+  axis.title = element_text(size = 12), 
+  axis.text.y = element_text(size = 12, color = "#000000"),
+  axis.text.x = element_text(size = 12, color = "#000000"))
+```
+
+Load in 49 bp sliding window data for reads mapped to standards references (NOT contigs)
+```{r}
+samples = data.frame(c("INF_1_1", "INF_1_1_20", "INF_1_1_1", "INF_2_1", "INF_2_1_20", "INF_2_1_1", "INF_2_2", "INF_2_2_20", "INF_2_2_1", 
+                      "INF_2_3", "INF_2_3_20", "INF_2_3_1", "INF_3_1", "INF_3_1_20", "INF_3_1_1", "EFF_1_1", "EFF_1_1_20", "EFF_1_1_1", 
+                      "EFF_2_1", "EFF_2_1_20", "EFF_2_1_1", "EFF_2_2", "EFF_2_2_20", "EFF_2_2_1", "EFF_2_3", "EFF_2_3_20", "EFF_2_3_1",
+                      "EFF_3_1", "EFF_3_1_20", "EFF_3_1_1"))
+sliding_window_files = c("Mapping/INF_1_1/standards_window49.txt", "Mapping/INF_1_1_20/standards_window49.txt", 
+                         "Mapping/INF_1_1_1/standards_window49.txt","Mapping/INF_2_1/standards_window49.txt", 
+                         "Mapping/INF_2_1_20/standards_window49.txt", "Mapping/INF_2_1_1/standards_window49.txt",
+                         "Mapping/INF_2_2/standards_window49.txt", "Mapping/INF_2_2_20/standards_window49.txt", 
+                         "Mapping/INF_2_2_1/standards_window49.txt", "Mapping/INF_2_3/standards_window49.txt", 
+                         "Mapping/INF_2_3_20/standards_window49.txt", "Mapping/INF_2_3_1/standards_window49.txt",
+                         "Mapping/INF_3_1/standards_window49.txt", "Mapping/INF_3_1_20/standards_window49.txt", 
+                         "Mapping/INF_3_1_1/standards_window49.txt", "Mapping/EFF_1_1/standards_window49.txt", 
+                         "Mapping/EFF_1_1_20/standards_window49.txt", "Mapping/EFF_1_1_1/standards_window49.txt",
+                         "Mapping/EFF_2_1/standards_window49.txt", "Mapping/EFF_2_1_20/standards_window49.txt", 
+                         "Mapping/EFF_2_1_1/standards_window49.txt", "Mapping/EFF_2_2/standards_window49.txt", 
+                         "Mapping/EFF_2_2_20/standards_window49.txt", "Mapping/EFF_2_2_1/standards_window49.txt",
+                         "Mapping/EFF_2_3/standards_window49.txt", "Mapping/EFF_2_3_20/standards_window49.txt", 
+                         "Mapping/EFF_2_3_1/standards_window49.txt", "Mapping/EFF_3_1/standards_window49.txt", 
+                         "Mapping/EFF_3_1_20/standards_window49.txt", "Mapping/EFF_3_1_1/standards_window49.txt")
+
+for (i in 1:nrow(samples)) {
+  temp <- as.data.frame(read.table(sliding_window_files[i], header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  temp$sample <- samples[i,1]
+  name <- "sample_w40bp"
+  name <- gsub("sample", samples[i,1], name)
+  assign(name, temp)
+}
+```
+
+Combine all the different samples into a single file
+```{r}
+samples = data.frame(c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1", "EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1"))
+sliding_window_list = list(INF_1_1_w40bp, INF_2_1_w40bp, INF_2_2_w40bp, INF_2_3_w40bp, INF_3_1_w40bp, EFF_1_1_w40bp,
+                           EFF_2_1_w40bp, EFF_2_2_w40bp, EFF_2_3_w40bp, EFF_3_1_w40bp)
+
+for (i in 1:nrow(samples)) {
+  stds_present <- aggregate(x = sliding_window_list[[i]][c("avg_depth")], by = sliding_window_list[[i]][c("ID")], 
+                            FUN = function(avg_depth){y <- mean(avg_depth); return(y)})
+  colnames(stds_present) <- c("ID", "total_avg_depth")
+
+  stds_present <- subset(stds_present, total_avg_depth > 0)
+  
+  sliding_window_list[[i]] <- merge(sliding_window_list[[i]], stds_present, by = "ID")
+  
+  sliding_window_list[[i]]$sample <- samples[i,1]
+  
+  filename = "Mapping/sample/standards_mapping_analysis.txt"
+  filename = gsub("sample", samples[i,1], filename)
+  results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+  colnames(results) <- c("ID", "E_rel", "C_o", "R_FVE", "B_G", "total_avg_depth")
+  
+  sliding_window_list[[i]] <- merge(sliding_window_list[[i]], results, by = "ID")
+}
+
+all_w40bp <- rbind.data.frame(sliding_window_list[[1]], sliding_window_list[[2]], sliding_window_list[[3]], sliding_window_list[[4]], sliding_window_list[[5]], sliding_window_list[[6]], sliding_window_list[[7]], sliding_window_list[[8]], sliding_window_list[[9]], sliding_window_list[[10]])
+
+all_w40bp <- all_w40bp[,1:9]
+colnames(all_w40bp) <- c("ID", "avg_GC", "avg_depth", "sample", "total_avg_depth", "E_rel", "C_o", "R_FVE", "B_G")
+```
+
+Need to bin based on total_avg_read_depth
+--> split into 0-10, 10-100, 100-1000, >1000
+```{r}
+all_w40bp_reg4 <- subset(all_w40bp, total_avg_depth >= 1000)
+
+quad_reg4 <- lm(avg_depth ~ poly(avg_GC, 2, raw = TRUE) + log(total_avg_depth), data = all_w40bp_reg4)
+summary(quad_reg4)
+
+for (i in 1:nrow(samples)) {
+  test <- subset(all_w40bp_reg4, sample == samples[i,1])
+  ID_list <- data.frame(unique(test$ID))
+  if (i == 1) {
+    RMSE_reg4 <- cbind.data.frame(c(samples[i,1], ID_list, 0, 0))
+    colnames(RMSE_reg4) <- c("sample", "ID", "rmse", "total_avg_depth")
+  } else {
+    temp <- cbind.data.frame(c(samples[i,1], ID_list, 0, 0))
+    colnames(temp) <- c("sample", "ID", "rmse", "total_avg_depth")
+    RMSE_reg4 <- rbind.data.frame(RMSE_reg4, temp)
+  }
+  for (j in 1:nrow(ID_list)) {
+    test_set <- subset(test, ID == ID_list[j,1])
+    pred <- predict.lm(quad_reg4, newdata = test_set)
+    RMSE_reg4$rmse[RMSE_reg4$ID == ID_list[j,1]] <- sqrt(sum((pred - test_set$avg_depth)^2/length(test_set$avg_depth)))
+    RMSE_reg4$total_avg_depth[RMSE_reg4$ID == ID_list[j,1]] <- mean(test_set$avg_depth)
+  }
+}
+RMSE_reg4$norm_rmse <- RMSE_reg4$rmse/RMSE_reg4$total_avg_depth
+
+ggplot(RMSE_reg4, aes(x=total_avg_depth, y=rmse)) +geom_point() + pretty_plot
+ggplot(RMSE_reg4, aes(x=total_avg_depth, y=norm_rmse)) + geom_point() + pretty_plot
+
+boxplot(RMSE_reg4$norm_rmse)
+out <- data.frame(boxplot.stats(RMSE_reg4$norm_rmse)$out)
+
+#plot(quad_reg4)
+# There are no outliers, therefore, save the quadratic regression results
+saveRDS(quad_reg4, "Regressions/quad_reg4")
+
+all_w40bp_reg4$pred <- predict(quad_reg4, all_w40bp_reg4)
+```
+
+```{r}
+all_w40bp_reg3 <- subset(all_w40bp, total_avg_depth >= 100 & total_avg_depth < 1000)
+
+quad_reg3 <- lm(log(avg_depth) ~ poly(avg_GC, 2, raw = TRUE) + log(total_avg_depth), data = all_w40bp_reg3)
+summary(quad_reg3)
+
+for (i in 1:nrow(samples)) {
+  test <- subset(all_w40bp_reg3, sample == samples[i,1])
+  ID_list <- data.frame(unique(test$ID))
+  if (i == 1) {
+    RMSE_reg3 <- cbind.data.frame(c(samples[i,1], ID_list, 0, 0))
+    colnames(RMSE_reg3) <- c("sample", "ID", "rmse", "total_avg_depth")
+  } else {
+    temp <- cbind.data.frame(c(samples[i,1], ID_list, 0, 0))
+    colnames(temp) <- c("sample", "ID", "rmse", "total_avg_depth")
+    RMSE_reg3 <- rbind.data.frame(RMSE_reg3, temp)
+  }
+  for (j in 1:nrow(ID_list)) {
+    test_set <- subset(test, ID == ID_list[j,1])
+    pred <- predict.lm(quad_reg3, newdata = test_set)
+    RMSE_reg3$rmse[RMSE_reg3$ID == ID_list[j,1]] <- sqrt(sum((pred - test_set$avg_depth)^2/length(test_set$avg_depth)))
+    RMSE_reg3$total_avg_depth[RMSE_reg3$ID == ID_list[j,1]] <- mean(test_set$avg_depth)
+  }
+}
+RMSE_reg3$norm_rmse <- RMSE_reg3$rmse/RMSE_reg3$total_avg_depth
+
+ggplot(RMSE_reg3, aes(x=total_avg_depth, y=rmse)) + geom_point() + pretty_plot
+
+boxplot(RMSE_reg3$norm_rmse)
+out <- data.frame(boxplot.stats(RMSE_reg3$norm_rmse)$out)
+
+#plot(quad_reg3)
+# There are no outliers, therefore, save the quadratic regression results
+saveRDS(quad_reg3, "Regressions/quad_reg3")
+
+all_w40bp_reg3$pred <- predict(quad_reg3, all_w40bp_reg3)
+all_w40bp_reg3$pred <- exp(all_w40bp_reg3$pred)
+```
+
+```{r}
+all_w40bp_reg2 <- subset(all_w40bp, total_avg_depth >= 10 & total_avg_depth < 100)
+
+quad_reg2 <- lm(log(avg_depth+1) ~ poly(avg_GC, 2, raw = TRUE) + poly(log(total_avg_depth), 2, raw = TRUE), data = all_w40bp_reg2)
+summary(quad_reg2)
+
+for (i in 1:nrow(samples)) {
+  test <- subset(all_w40bp_reg2, sample == samples[i,1])
+  ID_list <- data.frame(unique(test$ID))
+  if (i == 1) {
+    RMSE_reg2 <- cbind.data.frame(c(samples[i,1], ID_list, 0, 0))
+    colnames(RMSE_reg2) <- c("sample", "ID", "rmse", "total_avg_depth")
+  } else {
+    temp <- cbind.data.frame(c(samples[i,1], ID_list, 0, 0))
+    colnames(temp) <- c("sample", "ID", "rmse", "total_avg_depth")
+    RMSE_reg2 <- rbind.data.frame(RMSE_reg2, temp)
+  }
+  for (j in 1:nrow(ID_list)) {
+    test_set <- subset(test, ID == ID_list[j,1])
+    pred <- predict.lm(quad_reg2, newdata = test_set)
+    RMSE_reg2$rmse[RMSE_reg2$ID == ID_list[j,1]] <- sqrt(sum((pred - test_set$avg_depth)^2/length(test_set$avg_depth)))
+    RMSE_reg2$total_avg_depth[RMSE_reg2$ID == ID_list[j,1]] <- mean(test_set$avg_depth)
+  }
+}
+RMSE_reg2$norm_rmse <- RMSE_reg2$rmse/RMSE_reg2$total_avg_depth
+
+ggplot(RMSE_reg2, aes(x=total_avg_depth, y=norm_rmse)) + geom_point() + pretty_plot
+
+boxplot(RMSE_reg2$norm_rmse)
+out <- data.frame(boxplot.stats(RMSE_reg2$norm_rmse)$out)
+
+#plot(quad_reg2)
+# There are no outliers, therefore, save the quadratic regression results
+saveRDS(quad_reg2, "Regressions/quad_reg2")
+
+all_w40bp_reg2$pred <- predict(quad_reg2, all_w40bp_reg2)
+all_w40bp_reg2$pred <- exp(all_w40bp_reg2$pred) - 1
+```
+
+```{r}
+all_w40bp_reg1 <- subset(all_w40bp, total_avg_depth < 10)
+
+quad_reg1 <- lm(log(avg_depth+1) ~ poly(avg_GC, 2, raw = TRUE) + poly(total_avg_depth, 2, raw = TRUE) + poly(E_rel, 2, raw=TRUE), data = all_w40bp_reg1)
+summary(quad_reg1)
+
+all_w40bp_reg1_updated <- all_w40bp_reg1
+colnames(all_w40bp_reg1_updated) <- c("ID", "avg_GC", "avg_depth", "sample", "total_avg_depth", "E_rel", "C_o", "R_FVE", "B_G")
+quad_reg1_updated <- lm(log(avg_depth+1) ~ poly(avg_GC, 2, raw = TRUE) + poly(log(total_avg_depth), 2, raw = TRUE) + poly(E_rel, 2, raw=TRUE), data = all_w40bp_reg1_updated)
+summary(quad_reg1_updated)
+
+for (i in 1:nrow(samples)) {
+  test <- subset(all_w40bp_reg1, sample == samples[i,1])
+  ID_list <- data.frame(unique(test$ID))
+  if (i == 1) {
+    RMSE_reg1 <- cbind.data.frame(c(samples[i,1], ID_list, 0, 0))
+    colnames(RMSE_reg1) <- c("sample", "ID", "rmse", "total_avg_depth")
+  } else {
+    temp <- cbind.data.frame(c(samples[i,1], ID_list, 0, 0))
+    colnames(temp) <- c("sample", "ID", "rmse", "total_avg_depth")
+    RMSE_reg1 <- rbind.data.frame(RMSE_reg1, temp)
+  }
+  for (j in 1:nrow(ID_list)) {
+    test_set <- subset(test, ID == ID_list[j,1])
+    pred <- predict.lm(quad_reg1, newdata = test_set)
+    RMSE_reg1$rmse[RMSE_reg1$ID == ID_list[j,1]] <- sqrt(sum((pred - test_set$avg_depth)^2/length(test_set$avg_depth)))
+    RMSE_reg1$total_avg_depth[RMSE_reg1$ID == ID_list[j,1]] <- mean(test_set$avg_depth)
+  }
+}
+RMSE_reg1$norm_rmse <- RMSE_reg1$rmse/RMSE_reg1$total_avg_depth
+
+ggplot(RMSE_reg1, aes(x=total_avg_depth, y=norm_rmse)) + geom_point() + pretty_plot
+
+boxplot(RMSE_reg1$norm_rmse)
+out <- data.frame(boxplot.stats(RMSE_reg1$norm_rmse)$out)
+
+#plot(quad_reg1)
+# There are no outliers, therefore, save the quadratic regression results
+saveRDS(quad_reg1, "Regressions/quad_reg1")
+
+all_w40bp_reg1$pred <- predict(quad_reg1, all_w40bp_reg1)
+all_w40bp_reg1$pred <- exp(all_w40bp_reg1$pred) - 1
+```
+
+Q-Q plot figure
+```{r}
+quad_reg1.stdres = rstandard(quad_reg1)
+quad_reg2.stdres = rstandard(quad_reg2)
+quad_reg3.stdres = rstandard(quad_reg3)
+quad_reg4.stdres = rstandard(quad_reg4)
+
+quad_reg1.stdres <- cbind.data.frame(c("0-10 reads/bp"), quad_reg1.stdres)
+colnames(quad_reg1.stdres) <- c("regression", "stdres")
+quad_reg2.stdres <- cbind.data.frame(c("10-100 reads/bp"), quad_reg2.stdres)
+colnames(quad_reg2.stdres) <- c("regression", "stdres")
+quad_reg3.stdres <- cbind.data.frame(c("100-1,000 reads/bp"), quad_reg3.stdres)
+colnames(quad_reg3.stdres) <- c("regression", "stdres")
+quad_reg4.stdres <- cbind.data.frame(c("\u2265 1,000 reads/bp"), quad_reg4.stdres)
+colnames(quad_reg4.stdres) <- c("regression", "stdres")
+stdres <- rbind.data.frame(quad_reg1.stdres, quad_reg2.stdres, quad_reg3.stdres, quad_reg4.stdres)
+
+stdres$regression <- factor(stdres$regression, levels = c("0-10 reads/bp", "10-100 reads/bp", "100-1,000 reads/bp", "\u2265 1,000 reads/bp"))
+
+qq <- ggplot(stdres, aes(sample = stdres, group = regression)) + geom_qq(shape = 1, color="gray40") + geom_qq_line(linetype = "dashed") + facet_grid(.~regression) + 
+  pretty_plot + labs(x = "Normal Scores", y = "Standardized Residuals") + coord_fixed(ratio = 1)
+
+ggsave("figures/Figure_S4.png", plot = last_plot(), width = 16, height = 5.5, dpi = 400, units = "in", limitsize = TRUE)
+
+cairo_pdf("figures/Figure_S4.pdf", width = 16, height = 5.5)
+qq
+dev.off()
+```
+
+Visualize the differences between the different average read depth bins
+```{r}
+all_w40bp_reg4$norm_avg_depth <- all_w40bp_reg4$avg_depth/all_w40bp_reg4$total_avg_depth
+all_w40bp_reg4_results <- aggregate(x = all_w40bp_reg4[c("norm_avg_depth")], by = all_w40bp_reg4[c("avg_GC")], FUN = function(avg_depth){y <- mean(avg_depth); return(y)})
+all_w40bp_reg4_results <- merge(all_w40bp_reg4_results, aggregate(x = all_w40bp_reg4[c("norm_avg_depth")], by = all_w40bp_reg4[c("avg_GC")], FUN = function(avg_depth){y <- sd(avg_depth); return(y)}), by = "avg_GC")
+colnames(all_w40bp_reg4_results) <- c("avg_GC", "norm_avg_depth", "std_dev")
+all_w40bp_reg4_results$avg_GC <- all_w40bp_reg4_results$avg_GC*100
+all_w40bp_reg4_results$read_depth_cat <- ">1000 reads per bp"
+
+all_w40bp_reg3$norm_avg_depth <- all_w40bp_reg3$avg_depth/all_w40bp_reg3$total_avg_depth
+all_w40bp_reg3_results <- aggregate(x = all_w40bp_reg3[c("norm_avg_depth")], by = all_w40bp_reg3[c("avg_GC")], FUN = function(avg_depth){y <- mean(avg_depth); return(y)})
+all_w40bp_reg3_results <- merge(all_w40bp_reg3_results, aggregate(x = all_w40bp_reg3[c("norm_avg_depth")], by = all_w40bp_reg3[c("avg_GC")], FUN = function(avg_depth){y <- sd(avg_depth); return(y)}), by = "avg_GC")
+colnames(all_w40bp_reg3_results) <- c("avg_GC", "norm_avg_depth", "std_dev")
+all_w40bp_reg3_results$avg_GC <- all_w40bp_reg3_results$avg_GC*100
+all_w40bp_reg3_results$read_depth_cat <- "100-1000 reads per bp"
+
+all_w40bp_reg2$norm_avg_depth <- all_w40bp_reg2$avg_depth/all_w40bp_reg2$total_avg_depth
+all_w40bp_reg2_results <- aggregate(x = all_w40bp_reg2[c("norm_avg_depth")], by = all_w40bp_reg2[c("avg_GC")], FUN = function(avg_depth){y <- mean(avg_depth); return(y)})
+all_w40bp_reg2_results <- merge(all_w40bp_reg2_results, aggregate(x = all_w40bp_reg2[c("norm_avg_depth")], by = all_w40bp_reg2[c("avg_GC")], FUN = function(avg_depth){y <- sd(avg_depth); return(y)}), by = "avg_GC")
+colnames(all_w40bp_reg2_results) <- c("avg_GC", "norm_avg_depth", "std_dev")
+all_w40bp_reg2_results$avg_GC <- all_w40bp_reg2_results$avg_GC*100
+all_w40bp_reg2_results$read_depth_cat <- "10-100 reads per bp"
+
+all_w40bp_reg1$norm_avg_depth <- all_w40bp_reg1$avg_depth/all_w40bp_reg1$total_avg_depth
+all_w40bp_reg1_results <- aggregate(x = all_w40bp_reg1[c("norm_avg_depth")], by = all_w40bp_reg1[c("avg_GC")], FUN = function(avg_depth){y <- mean(avg_depth); return(y)})
+all_w40bp_reg1_results <- merge(all_w40bp_reg1_results, aggregate(x = all_w40bp_reg1[c("norm_avg_depth")], by = all_w40bp_reg1[c("avg_GC")], FUN = function(avg_depth){y <- sd(avg_depth); return(y)}), by = "avg_GC")
+colnames(all_w40bp_reg1_results) <- c("avg_GC", "norm_avg_depth", "std_dev")
+all_w40bp_reg1_results$avg_GC <- all_w40bp_reg1_results$avg_GC*100
+all_w40bp_reg1_results$read_depth_cat <- "<10 reads per bp"
+
+all_w40bp_results <- rbind.data.frame(all_w40bp_reg4_results, all_w40bp_reg3_results, all_w40bp_reg2_results, all_w40bp_reg1_results)
+all_w40bp_results$read_depth_cat <- factor(all_w40bp_results$read_depth_cat, levels = c("<10 reads per bp", "10-100 reads per bp", "100-1000 reads per bp", ">1000 reads per bp"))
+
+RMSE_filtered <- rbind.data.frame(RMSE_reg1, RMSE_reg2, RMSE_reg3, RMSE_reg4)
+
+ggplot(RMSE_filtered, aes(x=total_avg_depth, y=norm_rmse)) + geom_point() + pretty_plot + 
+  geom_vline(xintercept = c(1000, 100, 10)) + 
+  labs(x = "Average Read Depth Across Whole Target", y = "Normalized RMSE") +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) 
+```
+
+Develop relationship between norm_rmse and total_avg_depth
+```{r}
+E_detect <- readRDS("Regressions/Langenfeld_2024_E_detect")
+
+STDS <- as.data.frame(read.table("Spike-ins/STD_MIXES.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+STDS_list <- subset(STDS, !(is.na(MIX_A)))
+STDS_list <- rbind.data.frame(STDS_list, subset(STDS, !(is.na(ssDNA))))
+STDS_list <- data.frame(STDS_list$ID, STDS_list$length)
+colnames(STDS_list) <- c("ID", "length")
+
+samples = data.frame(c("INF_1_1", "INF_1_1_20", "INF_1_1_1", "INF_2_1", "INF_2_1_20", "INF_2_1_1", "INF_2_2", "INF_2_2_20", "INF_2_2_1", 
+                      "INF_2_3", "INF_2_3_20", "INF_2_3_1", "INF_3_1", "INF_3_1_20", "INF_3_1_1", "EFF_1_1", "EFF_1_1_20", "EFF_1_1_1", 
+                      "EFF_2_1", "EFF_2_1_20", "EFF_2_1_1", "EFF_2_2", "EFF_2_2_20", "EFF_2_2_1", "EFF_2_3", "EFF_2_3_20", "EFF_2_3_1",
+                      "EFF_3_1", "EFF_3_1_20", "EFF_3_1_1"))
+downsample =  rep(c(100, 20, 1), 10)
+sliding_window_list = list(INF_1_1_w40bp, INF_1_1_20_w40bp, INF_1_1_1_w40bp, INF_2_1_w40bp, INF_2_1_20_w40bp, INF_2_1_1_w40bp, INF_2_2_w40bp, INF_2_2_20_w40bp,
+                           INF_2_2_1_w40bp, INF_2_3_w40bp, INF_2_3_20_w40bp, INF_2_3_1_w40bp, INF_3_1_w40bp, INF_3_1_20_w40bp, INF_3_1_1_w40bp, EFF_1_1_w40bp,
+                           EFF_1_1_20_w40bp, EFF_1_1_1_w40bp, EFF_2_1_w40bp, EFF_2_1_20_w40bp, EFF_2_1_1_w40bp, EFF_2_2_w40bp, EFF_2_2_20_w40bp, EFF_2_2_1_w40bp,
+                           EFF_2_3_w40bp, EFF_2_3_20_w40bp, EFF_2_3_1_w40bp, EFF_3_1_w40bp, EFF_3_1_20_w40bp, EFF_3_1_1_w40bp)
+
+for (i in 1:nrow(samples)) {
+  filename = "Mapping/sample/standards_mapping_analysis.txt"
+  filename = gsub("sample", samples[i,1], filename)
+  results <- as.data.frame(read.table(filename, sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+  results$downsample <- downsample[i]
+  colnames(results) <- c("ID", "E_rel", "C_o", "R_FVE", "B_G", "total_avg_depth", "downsample")
+  results <- merge(results, STDS_list, by  = "ID")
+  results$E_cutoff <- predict.lm(E_detect, newdata = results)
+  results <- subset(results, E_rel > results$E_cutoff)
+  
+  colnames(sliding_window_list[[i]]) <- c("ID", "avg_GC", "avg_depth", "sample")
+  sliding_window_list[[i]] <- merge(sliding_window_list[[i]], results, by = "ID")
+  
+  ID_list <- data.frame(unique(results$ID))
+  for (j in 1:nrow(ID_list)) {
+    test_set <- subset(sliding_window_list[[i]], ID == ID_list[j,1])
+    if (test_set$total_avg_depth[1] >= 1000) {
+      pred <- predict(quad_reg4, newdata = test_set)
+    }
+    if (test_set$total_avg_depth[1] >= 100 & test_set$total_avg_depth[1] < 1000) {
+      pred <- predict(quad_reg3, newdata = test_set)
+      pred <- exp(pred)
+    }
+    if (test_set$total_avg_depth[1] >= 10 & test_set$total_avg_depth[1] < 100) {
+      pred <- predict(quad_reg2, newdata = test_set)
+      pred <- exp(pred) - 1
+    }
+    if (test_set$total_avg_depth[1] < 10) {
+      pred <- predict(quad_reg1, newdata = test_set)
+      pred <- exp(pred) - 1
+    }
+    results$RMSE[results$ID == ID_list[j,1]] <- sqrt(sum((pred - test_set$avg_depth)^2/length(test_set$avg_depth)))
+  }
+  
+  results$norm_rmse <- results$RMSE/results$total_avg_depth
+  
+  df_title = "sample_info"
+  df_title = gsub("sample", samples[i,1], df_title)
+  assign(df_title, results)
+}
+```
+
+```{r}
+all_info <- rbind.data.frame(INF_1_1_info, INF_1_1_20_info, INF_1_1_1_info, INF_2_1_info, INF_2_1_20_info, INF_2_1_1_info, INF_2_2_info, INF_2_2_20_info, INF_2_2_1_info, INF_2_3_info, INF_2_3_20_info, INF_2_3_1_info, INF_3_1_info, INF_3_1_20_info, INF_3_1_1_info, EFF_1_1_info, EFF_1_1_20_info, EFF_1_1_1_info, EFF_2_1_info, EFF_2_1_20_info, EFF_2_1_1_info, EFF_2_2_info, EFF_2_2_20_info, EFF_2_2_1_info, EFF_2_3_info, EFF_2_3_20_info, EFF_2_3_1_info, EFF_3_1_info, EFF_3_1_20_info, EFF_3_1_1_info)
+
+cutoff_info <- cbind.data.frame(all_info, signif(all_info$total_avg_depth, digits = 1))
+names(cutoff_info)[length(names(cutoff_info))] <- "total_avg_depth_rounded"
+cutoff_info <- aggregate(x = cutoff_info[c("RMSE")], by = cutoff_info[c("total_avg_depth_rounded")], FUN = function(RMSE){y <- max(RMSE); return(y)})
+
+my.formula <- y ~ x
+ggplot(cutoff_info, aes(x=total_avg_depth_rounded, y=RMSE)) + geom_point(color = "grey") + pretty_plot  + geom_vline(xintercept = c(10, 100, 1000), linetype = "dashed") +
+  geom_smooth(method = "lm", se = FALSE, color = "black", formula = my.formula) +
+    stat_poly_eq(formula = my.formula, 
+                 aes(label = paste(..eq.label.., ..rr.label.., sep = "~~"), size = 12),
+                 parse = TRUE) + 
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+```
+
+```{r}
+colnames(cutoff_info) <- c("total_avg_depth", "RMSE")
+cutoff_function1 <- lm(log(RMSE)+0.25 ~ log(total_avg_depth), data = subset(cutoff_info, total_avg_depth < 10))
+summary(cutoff_function1)
+cutoff_function2 <- lm(log(RMSE)+0.25 ~ log(total_avg_depth), data = subset(cutoff_info, total_avg_depth >= 10 & total_avg_depth < 100))
+summary(cutoff_function2)
+cutoff_function3 <- lm(log(RMSE)+0.25 ~ log(total_avg_depth), data = subset(cutoff_info, total_avg_depth >= 100 & total_avg_depth < 1000))
+summary(cutoff_function3)
+
+predicted_cutoff1 <- data.frame(RMSE_pred = predict(cutoff_function1, subset(cutoff_info, total_avg_depth < 10)), total_avg_depth=subset(cutoff_info, total_avg_depth < 10))
+colnames(predicted_cutoff1) <- c("RMSE_pred", "total_avg_depth", "RMSE")
+predicted_cutoff2 <- data.frame(RMSE_pred = predict(cutoff_function2, subset(cutoff_info, total_avg_depth >= 10 & total_avg_depth < 100)), total_avg_depth=subset(cutoff_info, total_avg_depth >= 10 & total_avg_depth < 100))
+colnames(predicted_cutoff2) <- c("RMSE_pred", "total_avg_depth", "RMSE")
+predicted_cutoff3 <- data.frame(RMSE_pred = predict(cutoff_function3, subset(cutoff_info, total_avg_depth >= 100 & total_avg_depth < 1000)), subset(cutoff_info, total_avg_depth >= 100 & total_avg_depth < 1000))
+colnames(predicted_cutoff3) <- c("RMSE_pred", "total_avg_depth", "RMSE")
+predicted_cutoff4 <- subset(all_info, total_avg_depth >= 1000)
+predicted_cutoff4 <- cbind.data.frame(predicted_cutoff4$total_avg_depth, predicted_cutoff4$RMSE)
+colnames(predicted_cutoff4) <- c("total_avg_depth", "RMSE")
+predicted_cutoff4$RMSE_pred <- max(predicted_cutoff4$RMSE)+exp(0.25)
+
+cutoff_function4 <- max(predicted_cutoff4$RMSE_pred)
+
+ggplot(all_info, aes(x=total_avg_depth, y=RMSE, color=factor(downsample))) + geom_point() + 
+  pretty_plot +
+  geom_vline(xintercept = c(10,100,1000), linetype = "dashed") + scale_colour_brewer(palette = "Dark2") +
+  geom_line(color='red',data = predicted_cutoff1, aes(x=total_avg_depth, y=exp(RMSE_pred))) + 
+  geom_line(color='red',data = predicted_cutoff2, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(color='red',data = predicted_cutoff3, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(data = predicted_cutoff4, aes(x=total_avg_depth, y=RMSE_pred), color="red") +
+  labs(x = "Average Read Depth (reads/bp)", y = "RMSE", color = "Downsample (%)") + 
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+
+ggsave("figures/stds_trend.png", plot = last_plot(), width=8, height=6, units="in", dpi = 320, limitsize = TRUE)
+
+saveRDS(cutoff_function1, "Regressions/cutoff_function1")
+saveRDS(cutoff_function2, "Regressions/cutoff_function2")
+saveRDS(cutoff_function3, "Regressions/cutoff_function3")
+saveRDS(cutoff_function4, "Regressions/cutoff_function4")
+```
+
+```{r}
+output_list <- c("Mapping/INF_1_1/standards_quant_correct.txt", "Mapping/INF_1_1_20/standards_quant_correct.txt", "Mapping/INF_1_1_1/standards_quant_correct.txt", "Mapping/INF_2_1/standards_quant_correct.txt", "Mapping/INF_2_1_20/standards_quant_correct.txt", "Mapping/INF_2_1_1/standards_quant_correct.txt", "Mapping/INF_2_2/standards_quant_correct.txt", "Mapping/INF_2_2_20/standards_quant_correct.txt", "Mapping/INF_2_2_1/standards_quant_correct.txt", "Mapping/INF_2_3/standards_quant_correct.txt", "Mapping/INF_2_3_20/standards_quant_correct.txt", "Mapping/INF_2_3_1/standards_quant_correct.txt", "Mapping/INF_3_1/standards_quant_correct.txt", "Mapping/INF_3_1_20/standards_quant_correct.txt", "Mapping/INF_3_1_1/standards_quant_correct.txt", "Mapping/EFF_1_1/standards_quant_correct.txt", "Mapping/EFF_1_1_20/standards_quant_correct.txt", "Mapping/EFF_1_1_1/standards_quant_correct.txt", "Mapping/EFF_2_1/standards_quant_correct.txt", "Mapping/EFF_2_1_20/standards_quant_correct.txt", "Mapping/EFF_2_1_1/standards_quant_correct.txt", "Mapping/EFF_2_2/standards_quant_correct.txt", "Mapping/EFF_2_2_20/standards_quant_correct.txt", "Mapping/EFF_2_2_1/standards_quant_correct.txt", "Mapping/EFF_2_3/standards_quant_correct.txt", "Mapping/EFF_2_3_20/standards_quant_correct.txt", "Mapping/EFF_2_3_1/standards_quant_correct.txt", "Mapping/EFF_3_1/standards_quant_correct.txt", "Mapping/EFF_3_1_20/standards_quant_correct.txt", "Mapping/EFF_3_1_1/standards_quant_correct.txt")
+
+for (i in 1:nrow(samples)) {
+  temp <- as.data.frame(read.table(output_list[[i]], sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+  name <- "sample_info_v2"
+  name <- gsub("sample", samples[i,1], name)
+  assign(name, temp)
+}
+
+all_info_v2 <- rbind.data.frame(INF_1_1_info_v2, INF_1_1_20_info_v2, INF_1_1_1_info_v2, INF_2_1_info_v2, INF_2_1_20_info_v2, INF_2_1_1_info_v2, INF_2_2_info_v2, INF_2_2_20_info_v2, INF_2_2_1_info_v2, INF_2_3_info_v2, INF_2_3_20_info_v2, INF_2_3_1_info_v2, INF_3_1_info_v2, INF_3_1_20_info_v2, INF_3_1_1_info_v2, EFF_1_1_info_v2, EFF_1_1_20_info_v2, EFF_1_1_1_info_v2, EFF_2_1_info_v2, EFF_2_1_20_info_v2, EFF_2_1_1_info_v2, EFF_2_2_info_v2, EFF_2_2_20_info_v2, EFF_2_2_1_info_v2, EFF_2_3_info_v2, EFF_2_3_20_info_v2, EFF_2_3_1_info_v2, EFF_3_1_info_v2, EFF_3_1_20_info_v2, EFF_3_1_1_info_v2)
+
+all_info_v2$status <- "Not Corrected"
+all_info_v2$status[all_info_v2$norm_rmse < all_info_v2$prev_norm_rmse] <- "decreased RMSE"
+all_info_v2$status[all_info_v2$norm_rmse > all_info_v2$prev_norm_rmse] <- "increased RMSE"
+
+write.table(all_info_v2, "figures/RMSE.txt", sep = "\t", col.names = TRUE, row.names = FALSE)
+
+fig_3b <- ggplot(all_info_v2, aes(x=total_avg_depth, y=RMSE)) + geom_point(shape = 1, color = "grey") + pretty_plot + 
+  geom_vline(xintercept = c(10,100,1000), linetype = "dashed") + 
+  geom_line(color='black',data = predicted_cutoff1, aes(x=total_avg_depth, y=exp(RMSE_pred))) + 
+  geom_line(color='black',data = predicted_cutoff2, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(color='black',data = predicted_cutoff3, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(data = predicted_cutoff4, aes(x=total_avg_depth, y=RMSE_pred), color='black') + 
+  labs(x = "Average Read Depth (reads/bp)", y = "RMSE", color = "Change\nin RMSE") + coord_fixed() +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) + scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+fig_3b
+ggsave("figures/Figure_3B.png", plot = last_plot(), width=6, height=5, units="in", dpi = 320, limitsize = TRUE)
+
+cairo_pdf("figures/Figure_3B.pdf", width=6, height=5)
+fig_3b
+dev.off()
+```
+
+Evaluate results of "cleaning up" mapping to databases
+```{r}
+samples <- data.frame(rep(c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1", "EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1"), 3))
+
+db_filter_list <- c("Mapping/INF_1_1/NCBI_viral_quant_correct.txt", "Mapping/INF_2_1/NCBI_viral_quant_correct.txt", "Mapping/INF_2_2/NCBI_viral_quant_correct.txt", "Mapping/INF_2_3/NCBI_viral_quant_correct.txt", "Mapping/INF_3_1/NCBI_viral_quant_correct.txt", "Mapping/EFF_1_1/NCBI_viral_quant_correct.txt", "Mapping/EFF_2_1/NCBI_viral_quant_correct.txt", "Mapping/EFF_2_2/NCBI_viral_quant_correct.txt", "Mapping/EFF_2_3/NCBI_viral_quant_correct.txt", "Mapping/EFF_3_1/NCBI_viral_quant_correct.txt", "Mapping/INF_1_1/NCBI_viral_genes_quant_correct.txt", "Mapping/INF_2_1/NCBI_viral_genes_quant_correct.txt", "Mapping/INF_2_2/NCBI_viral_genes_quant_correct.txt", "Mapping/INF_2_3/NCBI_viral_genes_quant_correct.txt", "Mapping/INF_3_1/NCBI_viral_genes_quant_correct.txt", "Mapping/EFF_1_1/NCBI_viral_genes_quant_correct.txt", "Mapping/EFF_2_1/NCBI_viral_genes_quant_correct.txt", "Mapping/EFF_2_2/NCBI_viral_genes_quant_correct.txt", "Mapping/EFF_2_3/NCBI_viral_genes_quant_correct.txt", "Mapping/EFF_3_1/NCBI_viral_genes_quant_correct.txt", "Mapping/INF_1_1/VirSorter_curated_db_quant_correct.txt", "Mapping/INF_2_1/VirSorter_curated_db_quant_correct.txt", "Mapping/INF_2_2/VirSorter_curated_db_quant_correct.txt", "Mapping/INF_2_3/VirSorter_curated_db_quant_correct.txt", "Mapping/INF_3_1/VirSorter_curated_db_quant_correct.txt", "Mapping/EFF_1_1/VirSorter_curated_db_quant_correct.txt", "Mapping/EFF_2_1/VirSorter_curated_db_quant_correct.txt", "Mapping/EFF_2_2/VirSorter_curated_db_quant_correct.txt", "Mapping/EFF_2_3/VirSorter_curated_db_quant_correct.txt", "Mapping/EFF_3_1/VirSorter_curated_db_quant_correct.txt")
+
+for (i in 1:nrow(samples)) {
+  if (i <= 10) {
+    db <- "NCBI_viral"
+  }
+  if (i <= 20 & i > 10) {
+    db <- "NCBI_viral_genes"
+  }
+  if (i > 20) {
+    db <- "VirSorter"
+  }
+  
+  filter <- as.data.frame(read.table(db_filter_list[i], header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  filter$database <- db
+  filter$sample <- samples[i,1]
+  name <- "sample_data"
+  name <- gsub("sample", samples[i,1], name)
+  name <- gsub("data", db, name)
+  assign(name, filter)
+}
+```
+
+Evaluate performance of correction with Scripts/quant_correction.R method
+```{r}
+db_info <- rbind.data.frame(INF_1_1_NCBI_viral, INF_2_1_NCBI_viral, INF_2_2_NCBI_viral, INF_2_3_NCBI_viral, INF_3_1_NCBI_viral, EFF_1_1_NCBI_viral, EFF_2_1_NCBI_viral, EFF_2_2_NCBI_viral, EFF_2_3_NCBI_viral, EFF_3_1_NCBI_viral, INF_1_1_NCBI_viral_genes, INF_2_1_NCBI_viral_genes, INF_2_2_NCBI_viral_genes, INF_2_3_NCBI_viral_genes, INF_3_1_NCBI_viral_genes, EFF_1_1_NCBI_viral_genes, EFF_2_1_NCBI_viral_genes, EFF_2_2_NCBI_viral_genes, EFF_2_3_NCBI_viral_genes, EFF_3_1_NCBI_viral_genes, INF_1_1_VirSorter, INF_2_1_VirSorter, INF_2_2_VirSorter, INF_2_3_VirSorter, INF_3_1_VirSorter, EFF_1_1_VirSorter, EFF_2_1_VirSorter, EFF_2_2_VirSorter, EFF_2_3_VirSorter, EFF_3_1_VirSorter)
+
+db_info$status <- "Not Corrected"
+db_info$status[db_info$RMSE < db_info$prev_RMSE] <- "decreased RMSE"
+db_info$status[db_info$RMSE > db_info$prev_RMSE] <- "increased RMSE"
+
+db_info_corrected <- cbind.data.frame(db_info$total_avg_depth, db_info$RMSE, db_info$status)
+colnames(db_info_corrected) <- c("total_avg_depth", "RMSE", "status")
+db_info_corrected$status[db_info_corrected$status == "decreased RMSE" | db_info_corrected$status == "increased RMSE"] <- "Corrected"
+temp <- cbind.data.frame(db_info$initial_total_avg_depth, db_info$prev_RMSE)
+colnames(temp) <- c("total_avg_depth", "RMSE")
+temp$status <- "Initial"
+db_info_corrected <- rbind.data.frame(temp, db_info_corrected)
+
+db_info_corrected$status <- factor(db_info_corrected$status, levels = c("Initial", "Not Corrected", "Corrected"))
+
+ggplot(db_info_corrected, aes(x=total_avg_depth, y=RMSE, color=status)) + geom_point(shape = 1) + pretty_plot + 
+  geom_vline(xintercept = c(10,100,1000), linetype = "dashed") + 
+  geom_line(color='black',data = predicted_cutoff1, aes(x=total_avg_depth, y=exp(RMSE_pred))) + 
+  geom_line(color='black',data = predicted_cutoff2, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(color='black',data = predicted_cutoff3, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(data = predicted_cutoff4, aes(x=total_avg_depth, y=RMSE_pred), color="black") + 
+  scale_colour_grey(start = 0.7, end = 0) + 
+  labs(x = "Average Read Depth (reads/bp)", y = "RMSE", color = "Change\nin RMSE") +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) + scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+
+ggsave("figures/db_trend.png", plot = last_plot(), width=8, height=6, units="in", dpi = 320, limitsize = TRUE)
+```
+
+```{r}
+all_info_v3 <- cbind.data.frame(all_info_v2$total_avg_depth, all_info_v2$RMSE, all_info_v2$status)
+colnames(all_info_v3) <- c("total_avg_depth", "RMSE", "status")
+all_info_v3$set <- "Mapping Reads to \nStandards"
+db_info_corrected$set <- "Mapping Reads to \nViral Genes and Genomes"
+
+all_info_v3 <- rbind.data.frame(all_info_v3, db_info_corrected)
+all_info_v3$set <- factor(all_info_v3$set, levels = c("Mapping Reads to \nStandards", "Mapping Reads to \nViral Genes and Genomes"))
+all_info_v3$status <- factor(all_info_v3$status, levels = c("Initial", "Not Corrected", "Corrected"))
+
+ggplot(all_info_v3, aes(x=total_avg_depth, y=RMSE, color=status)) + geom_point(shape = 1) + pretty_plot + 
+  geom_vline(xintercept = c(10,100,1000), linetype = "dashed") + facet_grid(.~set) +
+  geom_line(color='black',data = predicted_cutoff1, aes(x=total_avg_depth, y=exp(RMSE_pred))) + 
+  geom_line(color='black',data = predicted_cutoff2, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(color='black',data = predicted_cutoff3, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(data = predicted_cutoff4, aes(x=total_avg_depth, y=RMSE_pred), color="black") + 
+  scale_colour_grey(start = 0.8, end = 0) +
+  labs(x = "Average Read Depth (reads/bp)", y = "RMSE", color = "Correction Status") +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) + scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+```
+
+```{r}
+db_info_corrected <- subset(db_info, status != "Not Corrected")
+ggplot(db_info_corrected, aes(x=total_avg_depth, y=RMSE, color = status)) + geom_point(aes(x=total_avg_depth, y=prev_RMSE), color="grey", shape = 1) + geom_point() + pretty_plot + 
+  geom_vline(xintercept = c(10,100,1000), linetype = "dashed") + 
+  geom_line(color='black',data = predicted_cutoff1, aes(x=total_avg_depth, y=exp(RMSE_pred))) + 
+  geom_line(color='black',data = predicted_cutoff2, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(color='black',data = predicted_cutoff3, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(data = predicted_cutoff4, aes(x=total_avg_depth, y=RMSE_pred), color="black") + 
+  scale_colour_brewer(palette = "Dark2") + 
+  labs(x = "Average Read Depth (reads/bp)", y = "RMSE", color = "Change\nin RMSE") +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) + scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+```
+
+```{r}
+db_info_corrected$database <- factor(db_info_corrected$database, levels = c("NCBI_viral_genes", "NCBI_viral", "VirSorter"))
+ggplot(db_info_corrected, aes(x=total_avg_depth, y=RMSE, color = status)) +
+  geom_point(aes(x=total_avg_depth, y=prev_RMSE), color="grey", shape = 1) + geom_point() + pretty_plot + 
+  geom_vline(xintercept = c(10,100,1000), linetype = "dashed") + facet_grid(.~database) +
+  geom_line(color='black',data = predicted_cutoff1, aes(x=total_avg_depth, y=exp(RMSE_pred))) + 
+  geom_line(color='black',data = predicted_cutoff2, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(color='black',data = predicted_cutoff3, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(data = predicted_cutoff4, aes(x=total_avg_depth, y=RMSE_pred), color="black") + 
+  scale_colour_brewer(palette = "Dark2") + 
+  labs(x = "Average Read Depth (reads/bp)", y = "RMSE", color = "Change\nin RMSE") +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) + scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+```
+
+```{r}
+INF_1_1_focus <- subset(INF_1_1_NCBI_viral_genes, RMSE != prev_RMSE & total_avg_depth > 10 & total_avg_depth <= 100 & length > 1000)
+INF_1_1_corrected <- data.frame(read.table("Mapping/INF_1_1/NCBI_viral_genes_window49_corrected.txt", header = TRUE, sep = "\t"))
+colnames(INF_1_1_corrected) <- c("ID", "avg_GC", "avg_depth", "R_G", "C_o", "R_FVE", "B_G", "total_avg_depth", "length", "E_cutoff", "initial_avg_depth")
+
+for (i in 1:nrow(INF_1_1_focus)) {
+  #temp <- subset(INF_1_1_corrected, ID == INF_1_1_focus$ID[i])
+  #temp$position <- c(1:nrow(temp))
+  #temp1 <- cbind.data.frame(temp$position, temp$initial_avg_depth)
+  #colnames(temp1) <- c("position", "avg_depth")
+  #temp1$status <- "Initial Read Depth"
+  #temp2 <- cbind.data.frame(temp$position, temp$avg_depth)
+  #colnames(temp2) <- c("position", "avg_depth")
+  #temp2$status <- "Corrected \nRead Depth"
+  #temp1 <- rbind.data.frame(temp1, temp2)
+  
+  temp <- subset(INF_1_1_corrected, ID == INF_1_1_focus$ID[i])
+  temp$position <- c(1:nrow(temp))
+  predict.list <- predict(quad_reg2, newdata = temp)
+  temp$pred_depth <- exp(predict.list[[1]])
+  temp$upper <- temp$pred_depth + 1.5*sd(subset(temp, avg_depth > 0)$avg_depth)
+  temp$lower <- temp$pred_depth - 1.5*sd(subset(temp, avg_depth > 0)$avg_depth)
+  temp1 <- cbind.data.frame(temp$position, temp$initial_avg_depth, temp$pred_depth, temp$upper, temp$lower)
+  colnames(temp1) <- c("position", "avg_depth", "pred_depth", "upper", "lower")
+  temp1$status <- "Initial Read Depth"
+  temp2 <- cbind.data.frame(temp$position, temp$avg_depth, temp$pred_depth, temp$upper, temp$lower)
+  colnames(temp2) <- c("position", "avg_depth", "pred_depth", "upper", "lower")
+  temp2$status <- "Corrected \nRead Depth"
+  temp1 <- rbind.data.frame(temp1, temp2)
+  
+  temp1$status <- factor(temp1$status, levels = c("Initial Read Depth", "Corrected \nRead Depth"))
+  
+  if(temp1$lower[1] < 0) {
+    temp1$lower <- 0
+  }
+  
+  temp1$flag <- "None"
+  temp1$flag[temp1$avg_depth > temp1$upper] <- "Out"
+  temp1$flag[temp1$avg_depth < temp1$lower] <- "Out"
+  
+  map_correct <- ggplot(temp1, aes(x=position, y=avg_depth, group=status, color=flag, fill=flag)) + pretty_plot + 
+  annotate("rect", xmin=-Inf, xmax=Inf, ymin=temp1$lower[1], ymax=temp1$upper[1], fill="lightgray", alpha=0.5, color=NA) +
+  geom_bar(stat="identity") + scale_fill_manual(values=c("gray60", "red")) + scale_color_manual(values=c("gray60", "red")) +
+  geom_hline(yintercept=temp1$pred_depth[1], linetype="dashed") + 
+  facet_grid(status~.) + theme(legend.position = "none") +
+  labs(x = "Position Along Sequence", y = "Read Depth (reads/bp)", title = INF_1_1_focus$ID[i]) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+  
+  name <- "INF_1_1_cori"
+  name <- gsub("i", i, name)
+  assign(name, map_correct)
+}
+
+INF_1_1_cor22
+```
+
+```{r}
+ggsave("figures/Figure_3C.png", plot = INF_1_1_cor22, height = 7, width = 11, dpi = 320, limitsize = TRUE)
+
+cairo_pdf("figures/Figure_3C.pdf", height = 7, width = 11)
+INF_1_1_cor22
+dev.off()
+```
+
+There are several targets where most of the mapped read get "corrected"... I would argue that this indicates the target is not quantifiable because the mapping is only creating a stack of reads and it barely passed detection threshold requirements
+Calculate the percent of positions corrected out of all of the positions with mapping > 0
+```{r}
+samples <- data.frame(c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1", "EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1"))
+
+NCBI_correct_list <- c("Mapping/INF_1_1/NCBI_viral_window49_corrected.txt", "Mapping/INF_2_1/NCBI_viral_window49_corrected.txt", "Mapping/INF_2_2/NCBI_viral_window49_corrected.txt", "Mapping/INF_2_3/NCBI_viral_window49_corrected.txt", "Mapping/INF_3_1/NCBI_viral_window49_corrected.txt", "Mapping/EFF_1_1/NCBI_viral_window49_corrected.txt", "Mapping/EFF_2_1/NCBI_viral_window49_corrected.txt", "Mapping/EFF_2_2/NCBI_viral_window49_corrected.txt", "Mapping/EFF_2_3/NCBI_viral_window49_corrected.txt", "Mapping/EFF_3_1/NCBI_viral_window49_corrected.txt")
+NCBI_genes_correct_list <- c("Mapping/INF_1_1/NCBI_viral_genes_window49_corrected.txt", "Mapping/INF_2_1/NCBI_viral_genes_window49_corrected.txt", "Mapping/INF_2_2/NCBI_viral_genes_window49_corrected.txt", "Mapping/INF_2_3/NCBI_viral_genes_window49_corrected.txt", "Mapping/INF_3_1/NCBI_viral_genes_window49_corrected.txt", "Mapping/EFF_1_1/NCBI_viral_genes_window49_corrected.txt", "Mapping/EFF_2_1/NCBI_viral_genes_window49_corrected.txt", "Mapping/EFF_2_2/NCBI_viral_genes_window49_corrected.txt", "Mapping/EFF_2_3/NCBI_viral_genes_window49_corrected.txt", "Mapping/EFF_3_1/NCBI_viral_genes_window49_corrected.txt")
+VirSorter_correct_list <- c("Mapping/INF_1_1/VirSorter_curated_db_window49_corrected.txt", "Mapping/INF_2_1/VirSorter_curated_db_window49_corrected.txt", "Mapping/INF_2_2/VirSorter_curated_db_window49_corrected.txt", "Mapping/INF_2_3/VirSorter_curated_db_window49_corrected.txt", "Mapping/INF_3_1/VirSorter_curated_db_window49_corrected.txt", "Mapping/EFF_1_1/VirSorter_curated_db_window49_corrected.txt", "Mapping/EFF_2_1/VirSorter_curated_db_window49_corrected.txt", "Mapping/EFF_2_2/VirSorter_curated_db_window49_corrected.txt", "Mapping/EFF_2_3/VirSorter_curated_db_window49_corrected.txt", "Mapping/EFF_3_1/VirSorter_curated_db_window49_corrected.txt")
+
+db_info$frac_corrected <- 0
+
+for (i in 1:nrow(samples)) {
+  NCBI_corrected <- data.frame(read.table(NCBI_correct_list[i], header = TRUE, sep = "\t"))
+  temp <- aggregate.data.frame(NCBI_corrected[c("initial_avg_depth")], NCBI_corrected[c("ID")], FUN = function(x) {length(x)})
+  colnames(temp) <- c("ID", "num_positions")
+  changed <- subset(NCBI_corrected, avg_depth != initial_avg_depth)
+  temp <- merge(temp, aggregate.data.frame(changed[c("initial_avg_depth")], changed[c("ID")], FUN = function(x) {length(x)}), by = "ID")
+  colnames(temp) <- c("ID", "num_positions", "num_changed")
+  temp$frac_corrected <- temp$num_changed/temp$num_positions
+  for (j in 1:nrow(temp)) {
+    db_info$frac_corrected[db_info$sample == samples[i,1] & db_info$ID == temp$ID[j]] <- temp$frac_corrected[temp$ID == temp$ID[j]]
+  }
+  
+  NCBI_genes_corrected <- data.frame(read.table(NCBI_genes_correct_list[i], header = TRUE, sep = "\t"))
+  temp <- aggregate.data.frame(NCBI_genes_corrected[c("initial_avg_depth")], NCBI_genes_corrected[c("ID")], FUN = function(x) {length(x)})
+  colnames(temp) <- c("ID", "num_positions")
+  changed <- subset(NCBI_genes_corrected, avg_depth != initial_avg_depth)
+  temp <- merge(temp, aggregate.data.frame(changed[c("initial_avg_depth")], changed[c("ID")], FUN = function(x) {length(x)}), by = "ID")
+  colnames(temp) <- c("ID", "num_positions", "num_changed")
+  temp$frac_corrected <- temp$num_changed/temp$num_positions
+  for (j in 1:nrow(temp)) {
+    db_info$frac_corrected[db_info$sample == samples[i,1] & db_info$ID == temp$ID[j]] <- temp$frac_corrected[temp$ID == temp$ID[j]]
+  }
+  
+  VirSorter_corrected <- data.frame(read.table(VirSorter_correct_list[i], header = TRUE, sep = "\t"))
+  temp <- aggregate.data.frame(VirSorter_corrected[c("initial_avg_depth")], VirSorter_corrected[c("ID")], FUN = function(x) {length(x)})
+  colnames(temp) <- c("ID", "num_positions")
+  changed <- subset(VirSorter_corrected, avg_depth != initial_avg_depth)
+  temp <- merge(temp, aggregate.data.frame(changed[c("initial_avg_depth")], changed[c("ID")], FUN = function(x) {length(x)}), by = "ID")
+  colnames(temp) <- c("ID", "num_positions", "num_changed")
+  temp$frac_corrected <- temp$num_changed/temp$num_positions
+  for (j in 1:nrow(temp)) {
+    db_info$frac_corrected[db_info$sample == samples[i,1] & db_info$ID == temp$ID[j]] <- temp$frac_corrected[temp$ID == temp$ID[j]]
+  }
+}
+```
+
+```{r}
+db_info$database <- factor(db_info$database, levels = c("NCBI_viral_genes", "NCBI_viral", "VirSorter"))
+db_info$frac_corrected <- db_info$frac_corrected*100
+db_info$reg_bin <- "\u2265 1,000 reads/bp"
+db_info$reg_bin[db_info$initial_total_avg_depth < 1000 & db_info$initial_total_avg_depth >= 100] <- "100-1,000 reads/bp"
+db_info$reg_bin[db_info$initial_total_avg_depth < 100 & db_info$initial_total_avg_depth >= 10] <- "10-100 reads/bp"
+db_info$reg_bin[db_info$initial_total_avg_depth < 10] <- "1-10 reads/bp"
+db_info$reg_bin <- factor(db_info$reg_bin, levels = c("1-10 reads/bp", "10-100 reads/bp", "100-1,000 reads/bp", "\u2265 1,000 reads/bp"))
+ggplot(subset(db_info, status != "Not Corrected"), aes(x=frac_corrected, y=prev_RMSE, color = reg_bin)) +
+  geom_point() + pretty_plot + geom_vline(xintercept = 20) + facet_grid(status~database) +
+  scale_colour_brewer(palette = "Dark2") + 
+  labs(x = "Mapping Locations Deemed Non-Specific (%)", y = "RMSE", color = "Initial Average \nDepth Bin") +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+```
+
+What does the plot look like if we set 20% as the maximum fraction of mapping locations deemed non-specific mapping for a target to be quantified?
+```{r}
+db_info$cor_cat <- "\u2264 20%"
+db_info$cor_cat[db_info$frac_corrected > 20] <- "> 20%"
+db_info$cor_cat[db_info$frac_corrected == 0] <- "Not Corrected"
+db_info$cor_cat <- factor(db_info$cor_cat, levels <- c("Not Corrected", "\u2264 20%", "> 20%"))
+ggplot(db_info, aes(x=total_avg_depth, y=RMSE, color = status)) +
+  geom_point(aes(x=initial_total_avg_depth, y=prev_RMSE), color="grey", shape = 1) + geom_point() + pretty_plot + 
+  geom_vline(xintercept = c(10,100,1000), linetype = "dashed") + facet_grid(cor_cat~database) +
+  geom_line(color='black',data = predicted_cutoff1, aes(x=total_avg_depth, y=exp(RMSE_pred))) + 
+  geom_line(color='black',data = predicted_cutoff2, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(color='black',data = predicted_cutoff3, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(data = predicted_cutoff4, aes(x=total_avg_depth, y=RMSE_pred), color="black") + 
+  scale_colour_brewer(palette = "Dark2") + 
+  labs(x = "Average Read Depth (reads/bp)", y = "RMSE", color = "Change\nin RMSE") +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) + scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+```
+
+```{r}
+db_info$`Change in Read Depth Variability RMSE` <- db_info$RMSE - db_info$prev_RMSE
+db_info$RMSE_direction <- "None"
+db_info$RMSE_direction[db_info$`Change in Read Depth Variability RMSE` > 0] <- "RMSE Increased"
+db_info$RMSE_direction[db_info$`Change in Read Depth Variability RMSE` < 0] <- "RMSE Decreased"
+
+cutoff <- ggplot(subset(db_info, status != "Not Corrected" & `Change in Read Depth Variability RMSE` > -100), aes(x=frac_corrected, y=`Change in Read Depth Variability RMSE`, color = RMSE_direction)) +
+  geom_point(shape = 1) + pretty_plot + geom_vline(xintercept = 20) +
+  scale_colour_brewer(palette = "Dark2") + 
+  labs(x = "Percent of 49-bp Sliding Windows Altered", color = "Correction Impact on RMSE") +
+  theme(legend.position = "bottom") +
+  geom_hline(yintercept = 0, linetype = "dashed")
+
+ggsave("figures/20_cutoff_rational.png", plot = last_plot(), scale = 1, dpi = 320, limitsize = TRUE)
+
+cairo_pdf("figures/Figure_S7.pdf")
+cutoff
+dev.off()
+```
+
+### Figure S8
+```{r}
+### load in contigs derived from standards mapping results -- need initial and final RMSE values
+samples <- c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1", "EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1")
+for (i in samples) {
+  ### corrected RMSE & prev_RMSE for all standards' contigs
+  filename <- "Results/sample/standards_contigs_quant_correct.txt"
+  filename <- gsub("sample", i, filename)
+  temp <- read.table(filename, header = TRUE, sep = "\t")
+  temp$sample <- i
+  if (i == "INF_1_1") {
+    std_contigs <- temp
+  } else {
+    std_contigs <- rbind.data.frame(std_contigs, temp)
+  }
+}
+
+all_std_contigs <- cbind.data.frame("ID" = std_contigs$ID, "contig_ID" = std_contigs$contig_ID, "sample" = std_contigs$sample, "total_avg_depth" = std_contigs$gene_copies, "RMSE" = std_contigs$prev_RMSE, "status" = "Initial", "correction" = std_contigs$correction_status)
+all_std_contigs$status[!(is.na(all_std_contigs$correction))] <- "Initial with\nAssembly Issues"
+
+temp <- cbind.data.frame("ID" = std_contigs$ID, "contig_ID" = std_contigs$contig_ID, "sample" = std_contigs$sample, "total_avg_depth" = std_contigs$gene_copies, "RMSE" = std_contigs$RMSE, "status" = "Not Corrected", "correction" = std_contigs$correction_status)
+temp <- subset(temp, !(correction %in% c("error_no convergence", "error_high fraction corrected")))
+temp$status[temp$correction == "correctable"] <- "Corrected"
+
+all_std_contigs <- rbind.data.frame(all_std_contigs, temp)
+all_std_contigs$set <- "All Contigs Derived\nfrom Standards"
+```
+
+```{r}
+### Coarse quality control of the standards' contigs -- remove contigs with less than 80% alignment to standard -- run hpc_submission/standards_contigs_blastn_slurm.sh
+for (i in 1:10) {
+  filename <- "Mapping/sep_contigs/sample/Langenfeld_2022_standards_contigs.out"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp <- data.frame(read.table(filename, header = FALSE, sep = "\t"))
+  colnames(temp) <- c("contig_ID", "ID", "% identity", "alignment length", "mismatches", "gap opens", "q. start", "q. end", "s. start", "s. end", "evalue", "bit score")
+  
+  filename <- "Mapping/sep_contigs/sample/Langenfeld_2022_standards_contigs_length.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp1 <- data.frame(read.table(filename, header = FALSE, sep = "\t"))
+  colnames(temp1) <- c("contig_ID", "contig_length")
+  temp <- merge(temp, temp1, by = c("contig_ID"))
+  
+  temp$sample <- samples[[i]]
+  if (i == 1) {
+    all_blast <- temp
+  } else {
+    all_blast <- rbind.data.frame(all_blast, temp)
+  }
+}
+```
+
+```{r}
+all_blast$rel_alignment <- all_blast$`alignment length`/all_blast$contig_length
+
+all_blast$unique_ID <- paste(all_blast$sample, all_blast$ID, sep = "_")
+std_contigs$unique_ID <- paste(std_contigs$sample, std_contigs$ID, sep = "_")
+temp <- cbind.data.frame(std_contigs$unique_ID, std_contigs$gene_copies)
+colnames(temp) <- c("unique_ID", "total_avg_depth")
+all_blast <- merge(all_blast, temp, by = "unique_ID", all.x = TRUE)
+
+## remove contigs that shouldn't be considered here --> they should be removed from the contig databases
+## poor overlap is one cause, but there is also a habit of there being several very short contigs (fragments) that are redundant 
+remove_contigs_pooroverlap <- subset(all_blast, rel_alignment < 0.8)
+remove_contigs_pooroverlap <- cbind.data.frame(remove_contigs_pooroverlap$contig_ID, remove_contigs_pooroverlap$sample)
+colnames(remove_contigs_pooroverlap) <- c("contig_ID", "sample")
+
+counts <- data.frame(table(all_blast$unique_ID))
+counts <- subset(counts, Freq > 1)
+fragments <- subset(all_blast, unique_ID %in% counts$Var1)
+unique_frags <- unique(fragments$unique_ID)
+remove_fragments <- data.frame(fragments[1,])
+remove_fragments[1,] <- NA
+colnames(remove_fragments) <- c("unique_ID", "contig_ID", "ID", "% identity", "alignment length", "mismatches", "gap opens", "q. start", "q. end", "s. start", "s. end", "evalue", "bit score", "contig_length", "sample", "rel_alignment", "total_avg_depth")
+
+for (j in 1:length(unique_frags)) {
+  temp <- subset(fragments, unique_ID == unique_frags[j])
+  temp$min <- temp$`s. start`
+  temp$min[temp$`s. end` < temp$`s. start`] <- temp$`s. end`[temp$`s. end` < temp$`s. start`]
+  temp$max <- temp$`s. end`
+  temp$max[temp$`s. end` < temp$`s. start`] <- temp$`s. start`[temp$`s. end` < temp$`s. start`]
+  temp <- arrange(temp, min)
+  max_length <- max(temp$`alignment length`)
+  
+  for (i in 1:(nrow(temp))) {
+    if (i != nrow(temp)) {
+      mini <- temp$min[i+1]
+      maxi <- temp$max[i+1]
+      if ((temp$min[i] == temp$min[i+1]) & (temp$max[i] %in% c(mini:maxi))) {
+        remove_fragments <- rbind.data.frame(remove_fragments, temp[i,1:17])
+      }
+      if (temp$max[i] > temp$max[i+1]) {
+        remove_fragments <- rbind.data.frame(remove_fragments, temp[i+1,1:17])
+      } 
+      if (temp$max[i] %in% c(mini:maxi)) {
+        overlap = (temp$max[i] - temp$min[i+1])/(temp$max[i+1]-temp$min[i])
+        init = (temp$min[i+1] - temp$min[i])/(temp$max[i+1]-temp$min[i])
+        tip = (temp$max[i+1] - temp$max[i])/(temp$max[i+1]-temp$min[i])
+        
+        if (init < 0.2 & overlap <= 0.8) {
+          remove_fragments <- rbind.data.frame(remove_fragments, temp[i,1:17])
+        }
+        if (tip < 0.2 & overlap <= 0.8) {
+          remove_fragments <- rbind.data.frame(remove_fragments, temp[i+1,1:17])
+        }
+        if (overlap > 0.8) {
+          if (temp$`alignment length`[i] >= temp$`alignment length`[i+1]) {
+            remove_fragments <- rbind.data.frame(remove_fragments, temp[i+1,1:17])
+          } else {
+            remove_fragments <- rbind.data.frame(remove_fragments, temp[i,1:17])
+          }
+        }
+      }
+    }
+    
+    if (temp$`alignment length`[i] < 0.3*max_length) {
+      remove_fragments <- rbind.data.frame(remove_fragments, temp[i,1:17])
+    }
+  }
+}
+
+for (i in samples) {
+  temp <- subset(remove_contigs_pooroverlap, sample == i)
+  temp <- data.frame(temp$contig_ID)
+  colnames(temp) <- c("contig_ID")
+  
+  temp1 <- subset(remove_fragments, sample == i)
+  temp1 <- data.frame(temp1$contig_ID)
+  colnames(temp1) <- c("contig_ID")
+  temp <- rbind.data.frame(temp, temp1)
+  
+  filename <- "Mapping/sep_contigs/sample/Langenfeld_2022_standards_contigs_remove.txt"
+  filename <- gsub("sample", i, filename)
+  write.table(temp, filename, sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+}
+
+remove_fragments$uni_contig_ID <- paste(remove_fragments$sample, remove_fragments$contig_ID, sep = "_")
+remove_fragments <- distinct(remove_fragments)
+remove_fragments <- remove_fragments[2:nrow(remove_fragments),]
+
+all_blast$uni_contig_ID <- paste(all_blast$sample, all_blast$contig_ID, sep = "_")
+
+all_blast <- subset(all_blast, rel_alignment >= 0.8 & !(uni_contig_ID %in% remove_fragments$uni_contig_ID))
+```
+
+```{r}
+qc_std_contigs <- subset(all_std_contigs, contig_ID %in% all_blast$contig_ID)
+qc_std_contigs$set <- "Quality Controlled Contigs\nDerived from Standards"
+
+summary_std_contigs <- rbind.data.frame(all_std_contigs, qc_std_contigs)
+```
+
+```{r}
+summary_std_contigs$status <- factor(summary_std_contigs$status, levels = c("Initial", "Initial with\nAssembly Issues", "Not Corrected", "Corrected"))
+
+RMSE_plot <- ggplot(summary_std_contigs, aes(x=total_avg_depth, y=RMSE, color=status)) + geom_point(alpha = 0.5) + pretty_plot + 
+  geom_vline(xintercept = c(10,100,1000), linetype = "dashed") + facet_grid(.~set) +
+  geom_line(color='black',data = predicted_cutoff1, aes(x=total_avg_depth, y=exp(RMSE_pred))) + 
+  geom_line(color='black',data = predicted_cutoff2, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(color='black',data = predicted_cutoff3, aes(x=total_avg_depth, y=exp(RMSE_pred))) +
+  geom_line(data = predicted_cutoff4, aes(x=total_avg_depth, y=RMSE_pred), color="black") + 
+  scale_color_manual(values = c("grey80", "darkolivegreen3", "black", "tomato3")) + coord_fixed() +
+  labs(x = "Average Read Depth (reads/bp)", y = "Read Depth Variability RMSE", color = "Correction Status") +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) + scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  theme(legend.position = "bottom")
+
+RMSE_plot
+
+ggsave("figures/Figure_S8.png", plot = last_plot(), width=12, height=6, units="in", dpi = 320, limitsize = TRUE)
+
+cairo_pdf("figures/Figure_S8.pdf", width = 10, height = 5.5)
+RMSE_plot
+dev.off()
+```
+
+```{r}
+for (i in 1:length(samples)) {
+  filename <- "Results/sample/standards_contigs_quant_correct.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  quant_correct <- data.frame(read.table(filename, header = TRUE, sep = "\t"))
+  
+  quant_correct$sample <- samples[[i]]
+  
+  name <- "quant_correct_sample"
+  name <- gsub("sample", samples[[i]], name)
+  assign(name, quant_correct)
+  
+  filename <- "Mapping/sep_contigs/sample/Langenfeld_2022_standards_contigs_remove.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp <- data.frame(read.table(filename, header = FALSE, sep = "\t"))
+  quant_correct_v2 <- subset(quant_correct, !(contig_ID %in% temp$V1))
+  
+  quant_correct_v2$sample <- samples[[i]]
+  
+  name <- "quant_correct_sample_v2"
+  name <- gsub("sample", samples[[i]], name)
+  assign(name, quant_correct_v2)
+}
+
+quant_correct_v2 <- rbind.data.frame(quant_correct_INF_1_1_v2, quant_correct_INF_2_1_v2, quant_correct_INF_2_2_v2, quant_correct_INF_2_3_v2, quant_correct_INF_3_1_v2, quant_correct_EFF_1_1_v2, quant_correct_EFF_2_1_v2, quant_correct_EFF_2_2_v2, quant_correct_EFF_2_3_v2, quant_correct_EFF_3_1_v2)
+quant_correct_v2$unique_ID <- paste(quant_correct_v2$sample, quant_correct_v2$ID, sep = "_")
+quant_correct <- rbind.data.frame(quant_correct_INF_1_1, quant_correct_INF_2_1, quant_correct_INF_2_2, quant_correct_INF_2_3, quant_correct_INF_3_1, quant_correct_EFF_1_1, quant_correct_EFF_2_1, quant_correct_EFF_2_2, quant_correct_EFF_2_3, quant_correct_EFF_3_1)
+quant_correct$unique_ID <- paste(quant_correct$sample, quant_correct$ID, sep = "_")
+```
+
+```{r}
+std_contigs_correct_v2 <- cbind.data.frame(quant_correct_v2$unique_ID, quant_correct_v2$sample, quant_correct_v2$ID, quant_correct_v2$gene_copies, quant_correct_v2$RMSE, quant_correct_v2$RMSE_limit,quant_correct_v2$prev_RMSE, quant_correct_v2$frac_corrected, quant_correct_v2$correction_status, quant_correct_v2$reliability)
+std_contigs_correct_v2 <- distinct(std_contigs_correct_v2)
+colnames(std_contigs_correct_v2) <- c("unique_ID", "sample", "ID", "gene_copies", "RMSE", "RMSE_limit", "prev_RMSE", "frac_corrected", "correction_status", "reliability")
+
+std_contigs_correct <- cbind.data.frame(quant_correct$unique_ID, quant_correct$sample, quant_correct$ID, quant_correct$gene_copies, quant_correct$RMSE, quant_correct$RMSE_limit,quant_correct$prev_RMSE, quant_correct$frac_corrected, quant_correct$correction_status, quant_correct$reliability)
+std_contigs_correct <- distinct(std_contigs_correct)
+colnames(std_contigs_correct) <- c("unique_ID", "sample", "ID", "gene_copies", "RMSE", "RMSE_limit", "prev_RMSE", "frac_corrected", "correction_status", "reliability")
+```
+
+```{r}
+# are all of the std_contigs_error (and _v2) impacted by assembly errors?
+
+for (i in 1:length(samples)) {
+  filename <- "Mapping/sep_contigs/sample/Langenfeld_2022_standards_contigs_matching.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  matching <- data.frame(read.table(filename, header =  FALSE, sep = "\t"))
+  
+  filename <- "Mapping/sep_contigs/sample/Langenfeld_2022_standards_contigs_remove.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp <- data.frame(read.table(filename, header = FALSE, sep = "\t"))
+  matching_v2 <- subset(matching, !(V1 %in% temp$V1))
+  
+  colnames(matching) <- c("contig_ID", "standard_ID")
+  colnames(matching_v2) <- c("contig_ID", "standard_ID")
+  
+  errors <- subset(matching, !(contig_ID %in% matching_v2$contig_ID))
+  errors$sample <- samples[[i]]
+  
+  name <- "std_error_sample"
+  name <- gsub("sample", samples[[i]], name)
+  assign(name, errors)
+}
+
+std_error <- rbind.data.frame(std_error_INF_1_1, std_error_INF_2_1, std_error_INF_2_2, std_error_INF_2_3, std_error_INF_3_1, std_error_EFF_1_1, std_error_EFF_2_1, std_error_EFF_2_2, std_error_EFF_2_3, std_error_EFF_3_1)
+std_error$unique_ID <- paste(std_error$sample, std_error$standard_ID, sep = "_")
+
+std_error_list <- unique(std_error$unique_ID)
+length(std_error_list)
+
+std_contigs_correct$assembly_error <- "No"
+std_contigs_correct$assembly_error[std_contigs_correct$unique_ID %in% std_error_list] <- "Yes"
+nrow(subset(std_contigs_correct, assembly_error == "Yes" & prev_RMSE > RMSE_limit))
+nrow(subset(std_contigs_correct, assembly_error == "No" &  prev_RMSE > RMSE_limit))
+nrow(subset(std_contigs_correct, assembly_error == "Yes" & prev_RMSE <= RMSE_limit))
+
+std_contigs_correct_v2$assembly_error <- "No"
+std_contigs_correct_v2$assembly_error[std_contigs_correct_v2$unique_ID %in% std_error_list] <- "Yes"
+nrow(subset(std_contigs_correct_v2, assembly_error == "Yes" & prev_RMSE > RMSE_limit))
+nrow(subset(std_contigs_correct_v2, assembly_error == "No" &  prev_RMSE > RMSE_limit))
+nrow(subset(std_contigs_correct_v2, assembly_error == "Yes" & prev_RMSE <= RMSE_limit))
+
+std_contigs_error <- subset(std_contigs_correct, prev_RMSE > RMSE_limit)
+std_contigs_error_v2 <- subset(std_contigs_correct_v2, prev_RMSE > RMSE_limit)
+
+# is std_contigs_error_v2 contained in std_contigs_error?
+anomalies <- subset(std_contigs_error_v2, !(unique_ID %in% std_contigs_error$unique_ID))
+nrow(anomalies)
+# they are!!! indicating that removing fragments does not resolve issues with read mapping (v2 underwent bowtie2 read mapping without fragments or poor alignment included)
+
+# There are 26 standards' contigs that have high RMSE, but do not have assembly issues -- what is going on with those?
+anomalies <- subset(std_contigs_error_v2, assembly_error == "No" &  prev_RMSE > RMSE_limit)
+
+# subset the blast results from those anomalies
+anomalies_blast <- subset(all_blast, unique_ID %in% anomalies$unique_ID)
+```
+
+### Figure 3 for the manuscript #########################
+Directly compares read-based and contig-based concentrations of standards. (A) before quantification correction and (D) after quantification correction with a summary of the quantification detection and correction process (B) is the RMSE thresholds and (C) is a summary of the correction process overview.
+Dashed 1:1 line through the data with a linear trendline included too
+
+Create dataframe of data for the figure (only need to run this code ONCE)
+```{r}
+detection_threshold <- function(mapping_results, lengths) {
+  E_detect <- readRDS("Regressions/detection/Langenfeld_2024_E_detect")
+  
+  # make a list of the standards ID in the mapping file
+  targets = data.frame(unique(mapping_results$ID))
+  colnames(targets) <- "ID"
+  targets <- merge.data.frame(targets, lengths, by = "ID")
+  targets$B_G <- 0
+  targets$gene_copies <- 0
+  targets$I_G <- 0
+  targets$E_rel <- 0
+  
+  for(i in 1:nrow(targets)) {
+    # select genome information on specific genome from mapping table
+    target = subset(mapping_results, ID == targets$ID[i])
+    target$I_G_x <- 0
+    
+    # Calculate total number of bases mapping to genome and the average read depth (gene copies)
+    targets$B_G[i] = sum(target$read_depth)
+    targets$gene_copies[i] = mean(target$read_depth)
+    
+    # Calculate I_G and number of positions covered by at least 1 read
+    target$I_G_x <- (target$read_depth/targets$B_G[i])*log(target$read_depth/targets$B_G[i])
+    targets$I_G[i] <- -sum(na.omit(target$I_G_x))
+    
+    # Calculate E_rel
+    targets$E_rel[i] = targets$I_G[i]/log(targets$length[i])
+    
+    # Calculate E_detect
+    targets$E_detect <- predict(E_detect, targets)
+  }
+  
+  targets$detection_status <- "not_detected"
+  targets$detection_status[targets$E_rel >= targets$E_detect] <- "detected"
+  
+  mapping_targets_analysis = cbind.data.frame("ID" = targets$ID, "E_rel" = targets$E_rel, "gene_copies" = targets$gene_copies, "E_detect" = targets$E_detect, "detection_status" = targets$detection_status)
+  
+  return(mapping_targets_analysis)
+} 
+
+prediction <- function (mapping, DNA_input, DNA_conc, target_type) {
+  pred_conc_calc <- function(gc, mass, conc) {
+    predicted <- gc*conc/mass
+    # (gene copy standard_x)/(ng DNA library insert) = gene copies standard_x/ng total DNA*(ng DNA/µL DNA extract)
+    return(predicted)
+  }
+  
+  if (target_type == "database") {
+    result = data.frame(mapping$ID)
+    result$predicted_conc <- pred_conc_calc(mapping$gene_copies, DNA_input, DNA_conc)
+    colnames(result) <- c("ID", "predicted_conc")
+  } else {
+    result = cbind.data.frame("ID" = mapping$ID, "contig_ID" = mapping$contig_ID)
+    result$predicted_conc <- pred_conc_calc(mapping$gene_copies, DNA_input, DNA_conc)
+    colnames(result) <- c("ID", "contig_ID", "predicted_conc")
+  }
+  
+  return(result)
+}
+
+not_original <- function(concentration, conc_factor) { ### no longer include the recovery term
+  concentration$`concentration (gc/µL)` <- concentration$concentration..gc.µL.*(conc_factor)
+  concentration$`std deviation (gc/µL)` <- concentration$std.deviation..gc.µL.*(conc_factor)
+  return(concentration)
+}
+
+quant_unknown <- function(database_lengths, path_to_quant_regression, mapping_results, bin_assignment, target_type, DNA_input, DNA_conc) {
+  lengths <- data.frame(read.table(database_lengths, header = FALSE, sep = "\t", stringsAsFactors = FALSE))
+  colnames(lengths) <- c("ID", "length")
+  
+  quant_rel <- readRDS(path_to_quant_regression)
+  
+  # Assess which targets are above the detection threshold
+  mapping <- detection_threshold(mapping_results, lengths)
+  mapping[,2:4] <- lapply(mapping[,2:4], as.numeric)
+  mapping <- subset(mapping, E_rel >= E_detect)
+  
+  colnames(mapping) <- c("contig_ID", "E_rel", "gene_copies", "E_detect", "detection_status")
+  mapping <- merge.data.frame(mapping, bin_assignment, by = c("contig_ID"))
+  
+  # Convert targets' relative abundances to units of (gene copies/ng DNA)
+  results <- prediction(mapping, DNA_input, DNA_conc, target_type)
+  
+  # Convert relative abundance to absolute abundance
+  pred <- predict(quant_rel, newdata = results, se.fit = TRUE)
+  if (target_type == "database") {
+    results <- cbind.data.frame(results$ID, 10^(pred[[1]]), 10^(pred[[2]]*sqrt(pred[[3]]+1)))
+    colnames(results) <- c("ID", "concentration (gc/µL)",  "std deviation (gc/µL)")
+  } else {
+    results <- cbind.data.frame(results$ID, results$contig_ID, 10^(pred[[1]]), 10^(pred[[2]]*sqrt(pred[[3]]+1)))
+    colnames(results) <- c("ID", "contig_ID", "concentration (gc/µL)",  "std deviation (gc/µL)")
+  }
+  
+  return(results)
+}
+
+samples <- c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1", "EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1")
+
+sample_info <- as.data.frame(read.table("Spike-ins/2021_WW_sample_info.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+char <- as.data.frame(read.table("Sample_Characteristics/2021_WW_extraction_info.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+lengths <- as.data.frame(read.table("Map_Indexes/standards_length.txt", header = FALSE, sep = "\t", stringsAsFactors = FALSE))
+colnames(lengths) <- c("ID", "length")
+
+for (i in 1:length(samples)) {
+  filename <- "Results/sample/standards_results.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  reads <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  colnames(reads) <- c("ID", "read_conc", "read_std_dev")
+  
+  filename <- "Mapping/sample/standards_contigs_mapping.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  mapping <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  mapping <- arrange(mapping, ID, position)
+  filename <- "Mapping/sep_contigs/sample/Langenfeld_2022_standards_contigs_matching.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  bins <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  colnames(bins) <- c("contig_ID", "ID") 
+  filename <- "Mapping/sep_contigs/sample/Langenfeld_2022_standards_contigs_length.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  contigs_raw <- quant_unknown(filename, "Regressions/quantification/rel_to_abs", mapping, bins, "contigs", sample_info$lib_mass[[i]], sample_info$DNA_conc[[i]])
+  contigs_raw <- cbind.data.frame("ID" = contigs_raw$ID, contigs_raw[3:4])
+  colnames(contigs_raw) <- c("ID", "contigs_conc", "contigs_std_dev")
+  contigs_raw <- merge.data.frame(contigs_raw, reads, by = "ID", all.x = TRUE)
+  contigs_raw$correction <- "Before Quantification\nCorrection"
+  
+  filename <- "Results/sample/standards_contigs_results.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  contigs_corrected <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  contigs_corrected <- not_original(contigs_corrected, char$CF[[i]])
+  contigs_corrected <- cbind.data.frame("ID" = contigs_corrected$ID, "contigs_conc" = contigs_corrected$`concentration (gc/µL)`, "contigs_std_dev" = contigs_corrected$`std deviation (gc/µL)`)
+  contigs_corrected <- unique.data.frame(contigs_corrected)
+  contigs_corrected <- merge.data.frame(contigs_corrected, reads, by = "ID", all.x = TRUE)
+  contigs_corrected$correction <- "After Quantification\nCorrection"
+  
+  contigs <- rbind.data.frame(contigs_raw, contigs_corrected)
+  contigs$sample <- samples[[i]]
+  
+  if (i == 1) {
+    fig_3_df <- contigs
+  } else {
+    fig_3_df <- rbind.data.frame(fig_3_df, contigs)
+  }
+}
+
+write.table(fig_3_df, file = "figures/fig_3_df.txt", col.names = TRUE, row.names = FALSE, quote = TRUE, sep = "\t")
+```
+
+Import data frame and manipulate as necessary
+```{r}
+fig_3_df <- as.data.frame(read.table("figures/fig_3_df.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+
+fig_3_df$correction <- factor(fig_3_df$correction, levels = c("Before Quantification\nCorrection", "After Quantification\nCorrection"))
+
+expected <- as.data.table(read.table("Spike-ins/2021_WW_stds_ddPCR_conc.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE))
+expected <- melt(expected, value.name = "expected", variable.name = "sample")
+
+fig_3_df <- merge.data.frame(fig_3_df, expected, by = c("ID", "sample"))
+```
+
+Create figure and save it to the "figures" directory
+```{r}
+my.formula <- y ~ x
+ggplot(fig_3_df, aes(x = expected, y = contigs_conc, group = correction)) + facet_grid(.~correction) +
+  #geom_pointrange(aes(xmin = read_conc - read_std_dev, xmax = read_conc + read_std_dev, ymin = contigs_conc - contigs_std_dev, ymax = contigs_conc + contigs_std_dev), shape = 1, size = 0.2) +
+  geom_pointrange(aes(ymin = contigs_conc - contigs_std_dev, ymax = contigs_conc + contigs_std_dev), shape = 1, size = 0.2) +
+  pretty_plot + geom_smooth(method = "lm", se = FALSE, color = "blue", size = 0.5, formula = my.formula) +
+  stat_poly_eq(formula = my.formula, 
+               aes(label = paste(..eq.label.., ..rr.label.., sep = "~~"), size = 12),
+               parse = TRUE) +
+  labs(x = "Expected Concentration (gc/µL)", y = "Contig-based Concentration (gc/µL)") +
+  geom_abline(slope = 1, intercept = 0, linetype="dashed") +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+
+#ggsave("figures/Figure_3AD_v2.png", plot = last_plot(), width = 10, height = 7, dpi = 400, units = "in", limitsize = TRUE)
+```
+
+```{r}
+my.formula <- y ~ x
+Fig_3A <- ggplot(subset(fig_3_df, correction == "Before Quantification\nCorrection"), aes(x = expected, y = contigs_conc, group = correction)) + #facet_grid(.~correction) +
+  #geom_pointrange(aes(xmin = read_conc - read_std_dev, xmax = read_conc + read_std_dev, ymin = contigs_conc - contigs_std_dev, ymax = contigs_conc + contigs_std_dev), shape = 1, size = 0.2) +
+  geom_pointrange(aes(ymin = contigs_conc - contigs_std_dev, ymax = contigs_conc + contigs_std_dev), shape = 1, size = 0.2) +
+  pretty_plot + geom_smooth(method = "lm", se = FALSE, color = "blue", size = 0.5, formula = my.formula) +
+  stat_poly_eq(formula = my.formula, 
+               aes(label = paste(..eq.label.., ..rr.label.., sep = "~~"), size = 12),
+               parse = TRUE) +
+  labs(x = "Expected Concentration (gc/µL)", y = "Contig-based Concentration (gc/µL)") +
+  geom_abline(slope = 1, intercept = 0, linetype="dashed") +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+Fig_3A
+
+ggsave("figures/Figure_3A.png", plot = Fig_3A, width = 7, height = 5, dpi = 400, units = "in", limitsize = TRUE)
+
+cairo_pdf("figures/Figure_3A.pdf", height = 5, width = 7)
+Fig_3A
+dev.off()
+```
+
+```{r}
+my.formula <- y ~ x
+Fig_3D <- ggplot(subset(fig_3_df, correction == "After Quantification\nCorrection"), aes(x = expected, y = contigs_conc, group = correction)) + #facet_grid(.~correction) +
+  #geom_pointrange(aes(xmin = read_conc - read_std_dev, xmax = read_conc + read_std_dev, ymin = contigs_conc - contigs_std_dev, ymax = contigs_conc + contigs_std_dev), shape = 1, size = 0.2) +
+  geom_pointrange(aes(ymin = contigs_conc - contigs_std_dev, ymax = contigs_conc + contigs_std_dev), shape = 1, size = 0.2) +
+  pretty_plot + geom_smooth(method = "lm", se = FALSE, color = "blue", size = 0.5, formula = my.formula) +
+  stat_poly_eq(formula = my.formula, 
+               aes(label = paste(..eq.label.., ..rr.label.., sep = "~~"), size = 12),
+               parse = TRUE) +
+  labs(x = "Expected Concentration (gc/µL)", y = "Contig-based Concentration (gc/µL)") +
+  geom_abline(slope = 1, intercept = 0, linetype="dashed") +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+Fig_3D
+
+ggsave("figures/Figure_3D.png", plot = Fig_3D, width = 7, height = 5, dpi = 400, units = "in", limitsize = TRUE)
+
+cairo_pdf("figures/Figure_3D.pdf", height = 5, width = 7)
+Fig_3D
+dev.off()
+```
+
+
+```{r}
+test_set <- subset(fig_3_df, correction == "After Quantification\nCorrection")
+test_set$log10_diff <- abs(log10(test_set$read_conc) - log10(test_set$contigs_conc))/log10(test_set$read_conc)
+t.test(test_set$log10_diff, na.rm = TRUE)
+```
+
+### Figure 4 of the manuscript
+X-axis = not corrected concentrations
+Y-axis - corrected concentrations
+(A) viral databases 
+(B) viral contigs
+
+Dataframe for the database analysis
+```{r}
+CF <- as.data.frame(read.table("Sample_Characteristics/2021_WW_extraction_info.txt", header = TRUE, sep = "\t"))
+samples <- c("INF_1_1", "INF_2_1", "INF_2_2", "INF_2_3", "INF_3_1", "EFF_1_1", "EFF_2_1", "EFF_2_2", "EFF_2_3", "EFF_3_1")
+
+for (i in 1:length(samples)) {
+  filename <- "Mapping/sample/NCBI_viral_mapping_analysis.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  temp <- cbind.data.frame("ID" = temp$ID, "not_corrected" = temp$gene_copies)
+  temp$database <- "NCBI"
+  
+  filename <- "Mapping/sample/NCBI_viral_quant_correct.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp1 <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  temp1 <- cbind.data.frame("ID" = temp1$ID, "corrected" = temp1$total_avg_depth)
+  
+  temp <- merge.data.frame(temp1, temp, by = "ID", all.x = TRUE)
+  
+  filename <- "Mapping/sample/NCBI_viral_genes_mapping_analysis.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp1 <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  temp1 <- cbind.data.frame("ID" = temp1$ID, "not_corrected" = temp1$gene_copies)
+  temp1$database <- "NCBI_genes"
+  
+  filename <- "Mapping/sample/NCBI_viral_genes_quant_correct.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp2 <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  temp2 <- cbind.data.frame("ID" = temp2$ID, "corrected" = temp2$total_avg_depth)
+  
+  temp1 <- merge.data.frame(temp2, temp1, by = "ID", all.x = TRUE)
+  temp <- rbind.data.frame(temp, temp1)
+  
+  filename <- "Mapping/sample/VirSorter_curated_db_mapping_analysis.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp1 <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  temp1 <- cbind.data.frame("ID" = temp1$ID, "not_corrected" = temp1$gene_copies)
+  temp1$database <- "VirSorter"
+  
+  filename <- "Mapping/sample/VirSorter_curated_db_quant_correct.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp2 <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  temp2 <- cbind.data.frame("ID" = temp2$ID, "corrected" = temp2$total_avg_depth)
+  
+  temp1 <- merge.data.frame(temp2, temp1, by = "ID", all.x = TRUE)
+  temp <- rbind.data.frame(temp, temp1)
+  
+  temp$sample <- samples[[i]]
+  
+  if (i == 1) {
+    read_mapping <- temp
+  } else {
+    read_mapping <- rbind.data.frame(read_mapping, temp)
+  }
+}
+
+quant_rel <- readRDS("Regressions/Langenfeld_2024_rel_to_abs")
+sample_info <- read.table("Spike-ins/2021_WW_sample_info.txt", sep = "\t", header = TRUE)
+
+for (i in 1:length(samples)) {
+  filename <- "Results/sample/viral_bins_derep_mapping_analysis.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  colnames(temp) <- c("ID", "E_rel", "gene_copies", "E_detect", "detection_status")
+  
+  temp$predicted_conc <- temp$gene_copies*sample_info$DNA_conc[i]/sample_info$lib_mass[i]
+  pred <- predict(quant_rel, newdata = temp, se.fit = TRUE)
+  results <- cbind.data.frame(temp$ID, 10^(pred[[1]]), 10^(pred[[2]]*sqrt(pred[[3]]+1)))
+  colnames(results) <- c("ID", "not_corrected",  "sd_not_corrected")
+  
+  filename <- "Results/sample/viral_bins_derep_results.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp1 <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  temp1 <- temp1[,2:4]
+  colnames(temp1) <- c("ID", "corrected", "sd_corrected")
+  
+  temp <- merge.data.frame(temp1, results, by = "ID", all.x = TRUE)
+  temp$sample <- samples[[i]]
+  temp$corrected <- temp$corrected*CF$CF[i]*CF$recovery[i]
+  
+  if (i == 1) {
+    contig_mapping <- temp
+  } else {
+    contig_mapping <- rbind.data.frame(contig_mapping, temp)
+  }
+}
+```
+
+Overview of reference quantification undergoing correction
+```{r}
+for (i in 1:length(samples)) {
+  filename <- "Mapping/sample/NCBI_viral_mapping_analysis.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  temp <- cbind.data.frame("ID" = temp$ID, "not_corrected" = temp$gene_copies)
+  
+  filename <- "Mapping/sample/NCBI_viral_quant_correct.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp1 <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  temp1$quantifiable <- "yes"
+  temp1$quantifiable[temp1$RMSE > temp1$RMSE_limit] <- "no"
+  temp1 <- cbind.data.frame("ID" = temp1$ID, "corrected" = temp1$total_avg_depth, "quantifiable" = temp1$quantifiable)
+  
+  temp <- merge.data.frame(temp1, temp, by = "ID", all.x = TRUE)
+  temp$database <- "NCBI_viral"
+  
+  filename <- "Mapping/sample/NCBI_viral_genes_mapping_analysis.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp1 <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  temp1 <- cbind.data.frame("ID" = temp1$ID, "not_corrected" = temp1$gene_copies)
+  
+  filename <- "Mapping/sample/NCBI_viral_genes_quant_correct.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp2 <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  temp2$quantifiable <- "yes"
+  temp2$quantifiable[temp2$RMSE > temp2$RMSE_limit] <- "no"
+  temp2 <- cbind.data.frame("ID" = temp2$ID, "corrected" = temp2$total_avg_depth, "quantifiable" = temp2$quantifiable)
+  
+  temp1 <- merge.data.frame(temp2, temp1, by = "ID", all.x = TRUE)
+  temp1$database <- "NCBI_viral_genes"
+  temp <- rbind.data.frame(temp, temp1)
+  
+  filename <- "Mapping/sample/VirSorter_curated_db_mapping_analysis.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp1 <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  temp1 <- cbind.data.frame("ID" = temp1$ID, "not_corrected" = temp1$gene_copies)
+  
+  filename <- "Mapping/sample/VirSorter_curated_db_quant_correct.txt"
+  filename <- gsub("sample", samples[[i]], filename)
+  temp2 <- as.data.frame(read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE))
+  temp2$quantifiable <- "yes"
+  temp2$quantifiable[temp2$RMSE > temp2$RMSE_limit] <- "no"
+  temp2 <- cbind.data.frame("ID" = temp2$ID, "corrected" = temp2$total_avg_depth, "quantifiable" = temp2$quantifiable)
+  
+  temp1 <- merge.data.frame(temp2, temp1, by = "ID", all.x = TRUE)
+  temp1$database <- "VirSorter_curated_db"
+  temp <- rbind.data.frame(temp, temp1)
+  
+  temp$sample <- samples[[i]]
+  
+  if (i == 1) {
+    read_mapping_2 <- temp
+  } else {
+    read_mapping_2 <- rbind.data.frame(read_mapping_2, temp)
+  }
+}
+```
+
+Stats: number of targets mapped to, number of targets undergoing quant correction, number of targets not quantifiable, percent of reads (gc mapped to not quant/gc mapped to all db targets)
+These results are inaccurate for the last two columns b/c it doesn't consider the other cutoff for quant correction! The numbers are lower than they should be (values in manuscript are correct)
+```{r}
+percent_not_quant <- function(mapping) {
+  gc_not_quant <- sum(subset(mapping, quantifiable == "no")$not_corrected)
+  gc_all_to_db <- sum(mapping$not_corrected)
+  return(100*gc_not_quant/gc_all_to_db)
+}
+
+quant_correct_db_stats <- data.frame("database" = c("NCBI", "NCBI_genes", "VirSorter"), "Num_Targets" = c(nrow(subset(read_mapping_2, database == "NCBI_viral")), nrow(subset(read_mapping_2, database == "NCBI_viral_genes")), nrow(subset(read_mapping_2, database == "VirSorter_curated_db"))), "Num_Need_Correction" = c(nrow(subset(read_mapping_2, database == "NCBI_viral" & corrected != not_corrected)), nrow(subset(read_mapping_2, database == "NCBI_viral_genes" & corrected != not_corrected)), nrow(subset(read_mapping_2, database == "VirSorter_curated_db" & corrected != not_corrected))), "Num_Not_Quantifiable" = c(nrow(subset(read_mapping_2, database == "NCBI_viral" & quantifiable == "no")), nrow(subset(read_mapping_2, database == "NCBI_viral_genes" & quantifiable == "no")), nrow(subset(read_mapping_2, database == "VirSorter_curated_db" & quantifiable == "no"))), "Percent_Reads_Not_Quantifiable" = c(percent_not_quant(subset(read_mapping_2, database == "NCBI_viral")), percent_not_quant(subset(read_mapping_2, database == "NCBI_viral_genes")), percent_not_quant(subset(read_mapping_2, database == "VirSorter_curated_db"))))
+```
+
+Convert read mapping to concentrations
+```{r}
+quant_lr <- readRDS("Regressions/Langenfeld_2024_rel_to_abs")
+read_mapping$conc_not_corrected <- predict.lm(quant_lr, newdata = cbind.data.frame("ID" = read_mapping$ID, "predicted_conc" = read_mapping$not_corrected))
+read_mapping$conc_corrected <- predict.lm(quant_lr, newdata = cbind.data.frame("ID" = read_mapping$ID, "predicted_conc" = read_mapping$corrected))
+read_mapping$conc_not_corrected <- 10^(read_mapping$conc_not_corrected)
+read_mapping$conc_corrected <- 10^(read_mapping$conc_corrected)
+```
+
+Combine dataframes
+```{r}
+contig_mapping <- cbind.data.frame("ID" = contig_mapping$ID, "conc_corrected" = contig_mapping$corrected, "conc_not_corrected" = contig_mapping$not_corrected, "sample" = contig_mapping$sample, "group" = "contigs")
+read_mapping <- cbind.data.frame("ID" = read_mapping$ID, "conc_corrected" = read_mapping$conc_corrected, "conc_not_corrected" = read_mapping$conc_not_corrected, "sample" = read_mapping$sample, "group" = "reads")
+
+results_mapping <- rbind.data.frame(contig_mapping, read_mapping)
+```
+
+How much did the concentration of database targets undergoing correction change?
+```{r}
+corrected <- subset(read_mapping, conc_not_corrected != conc_corrected)
+corrected$rel_diff <- abs((corrected$conc_not_corrected-corrected$conc_corrected)/corrected$conc_not_corrected)
+corrected <- subset(corrected, conc_corrected != 0)
+t.test(corrected$rel_diff)
+
+corrected$rel_diff_2 <- (corrected$conc_not_corrected-corrected$conc_corrected)/corrected$conc_not_corrected
+t.test(corrected$rel_diff_2)
+
+corrected <- subset(contig_mapping, conc_not_corrected != conc_corrected)
+corrected$rel_diff <- abs((corrected$conc_not_corrected-corrected$conc_corrected)/corrected$conc_not_corrected)
+corrected <- subset(corrected, conc_corrected != 0)
+t.test(corrected$rel_diff)
+
+corrected$rel_diff_2 <- (corrected$conc_not_corrected-corrected$conc_corrected)/corrected$conc_not_corrected
+t.test(corrected$rel_diff_2)
+```
+
+Plot the results
+```{r}
+my.formula <- y ~ x
+results_mapping$group <- factor(results_mapping$group, levels = c("reads", "contigs"))
+correct_impact <- ggplot(results_mapping, aes(x = conc_not_corrected, y = conc_corrected)) + 
+  geom_point(shape = 1, color = "grey") + facet_grid(.~group) +
+  pretty_plot +
+  labs(x = "Concentration without Correction (gc/µL)", y = "Concentration with Correction (gc/µL)") +
+  #geom_smooth(method = "lm", se = FALSE, color = "black", linetype = "dashed", size = 0.5, formula = my.formula) +
+  #geom_abline(slope = 1, intercept = 0, linetype="dashed") +
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x))) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x), labels = trans_format("log10", math_format(10^.x)))
+
+ggsave("figures/Figure_4.png", plot = last_plot(), width = 7, height = 5, dpi = 400, units = "in", limitsize = TRUE)
+
+cairo_pdf("figures/Figure_4.pdf", width = 7, height = 5)
+correct_impact
+dev.off()
+
+correct_impact
+```
+
+### Percent of contigs that underwent correction
+```{r}
+for (i in samples) {
+  filename <- "Results/sample/viral_bins_derep_quant_correct.txt"
+  filename <- gsub("sample", i, filename)
+  temp <- read.table(filename, sep = "\t", header = TRUE)
+  
+  if (i == "INF_1_1") {
+    contigs_quant_correct <- temp
+  } else {
+    contigs_quant_correct <- rbind.data.frame(contigs_quant_correct, temp)
+  }
+}
+
+nrow(contigs_quant_correct)
+100*nrow(subset(contigs_quant_correct, frac_corrected > 0))/nrow(contigs_quant_correct)
+100*nrow(subset(contigs_quant_correct, frac_corrected > 0.2))/nrow(contigs_quant_correct)
+100*nrow(subset(contigs_quant_correct, frac_corrected <= 0.2 & frac_corrected > 0))/nrow(contigs_quant_correct)
+
+##false positive rate
+gc_not_quant <- sum(subset(contigs_quant_correct, frac_corrected > 0.2)$gene_copies)
+gc_all_to_db <- sum(contigs_quant_correct$gene_copies)
+gc_not_quant/gc_all_to_db
+```
+
+#### Pull out a specific example of correction significantly altering the concentration of a target
+Look only at read-based quantified targets
+```{r}
+read_mapping$rel_diff <- (read_mapping$conc_not_corrected-read_mapping$conc_corrected)/read_mapping$conc_not_corrected
+read_mapping$fold_diff <- read_mapping$conc_not_corrected/read_mapping$conc_corrected
+read_mapping$fold_diff2 <- read_mapping$conc_corrected/read_mapping$conc_not_corrected
+read_mapping_corrected <- subset(read_mapping, rel_diff != 0)
+
+temp <- read_mapping_corrected[grep("GeneID", read_mapping_corrected$ID),]
+read_mapping_corrected <- subset(read_mapping_corrected, !(ID %in% temp$ID))
+
+## only using results from INF_2_1 and EFF_2_2
+read_mapping_corrected <- subset(read_mapping_corrected, sample %in% c("INF_1_1", "INF_2_1", "INF_3_1", "EFF_1_1", "EFF_2_2", "EFF_3_1"))
+
+mean(subset(read_mapping_corrected, ID == "NC_026017.1")$fold_diff)
+mean(subset(read_mapping_corrected, ID == "NC_019527.1")$rel_diff)
+```
+
+
